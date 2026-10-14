@@ -1,6 +1,0 @@
-Paquetes de texturas mejoradas. Cada paquete va en su propia carpeta aqui dentro,
-por ejemplo texturas\Pandora UHD\..., y aparece en el lanzador en
-Graficos > Paquete de texturas.
-
-Sirven los paquetes de Dolphin tal cual, con sus subcarpetas: archivos tex1_...png
-o tex1_...dds (BC1, BC2, BC3, BC7 o 32 bits).
