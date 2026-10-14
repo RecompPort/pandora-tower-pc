@@ -1,0 +1,42 @@
+diff --git a/runtime/video.cpp b/runtime/video.cpp
+index 8727fec..9f7884f 100644
+--- a/runtime/video.cpp
++++ b/runtime/video.cpp
+@@ -1853,7 +1853,7 @@ int letterbox_rows(const uint8_t* px, int rows, int kCols) { return bar_size(px,
+ int bar_size_edges(const uint8_t* px, int len, int lines, char* why, size_t whylen) {
+     auto dark = [&](int l, int i) {
+         const uint8_t* q = px + ((size_t)l * len + (size_t)i) * 4;
+-        return std::max({q[0], q[1], q[2]}) <= 40;
++        return std::max({q[0], q[1], q[2]}) <= 24;                   // a bar's black, not a dark scene's
+     };
+     auto run_lo = [&](int l) { int i = 0; while (i < len && dark(l, i)) ++i; return i; };
+     auto run_hi = [&](int l) { int i = 0; while (i < len && dark(l, len - 1 - i)) ++i; return i; };
+@@ -1871,7 +1871,11 @@ int bar_size_edges(const uint8_t* px, int len, int lines, char* why, size_t whyl
+     int lo = std::min(a_lo, b_lo), hi = std::min(a_hi, b_hi);
+     int bar = std::min(lo, hi);
+     bool bars = bar >= len * 4 / 100 && bar <= len * 35 / 100 && std::abs(lo - hi) <= len * 3 / 100;
+-    return bars ? bar : 0;
++    if (bars) return bar;
++    // dark at both ends, but not alike (a dark scene running into the bars):
++    // can't tell yet, wait for a clearer picture
++    if (lo >= len * 4 / 100 && hi >= len * 4 / 100) return -1;
++    return 0;
+ }
+ 
+ // the bars of the movies measured before (this game's are all alike): kept in
+@@ -1976,11 +1980,13 @@ void find_letterbox(const Tex& t) {
+         if (v >= 0 && hz >= 0) {
+             static int n = 0;
+             if (n++ < 20) rt_log("video: movie measured: rows (%s) -> %d, columns (%s) -> %d", why_v, v, why_h, hz);
+-            movie_locked = hint == 1;                                 // a loading screen is watched as it goes
++            // bars found: kept to the movie's end; none found: the movie is
++            // still watched as it goes (its first picture may not show them)
++            movie_locked = hint == 1 && (v > 0 || hz > 0);            // a loading screen is watched as it goes
+             fresh_tries = 0;
+-            remember_movie_bars(kind, target_v, target_h);
+             target_v = (float)v / (float)t.h;
+             target_h = (float)hz / (float)t.w;
++            if (v > 0 || hz > 0) remember_movie_bars(kind, target_v, target_h);
+             seen_v = v; seen_h = hz; agree = 3;
+             letterbox.store(target_v);
+             pillarbox.store(target_h);

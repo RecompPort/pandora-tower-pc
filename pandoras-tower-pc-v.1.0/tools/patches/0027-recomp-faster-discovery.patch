@@ -1,0 +1,218 @@
+diff --git a/ppc.py b/ppc.py
+index 66358fe..42d1648 100644
+--- a/ppc.py
++++ b/ppc.py
+@@ -131,8 +131,20 @@ SPR_NAMES = {1: "xer", 8: "lr", 9: "ctr", 18: "dsisr", 19: "dar", 22: "dec", 25:
+              1022: "thrm3"}
+ 
+ 
++_DECODED = {}
++
++
+ def decode(w):
+-    """Decode one big-endian instruction word. Unknown encodings -> op '.long'."""
++    """Decode one big-endian instruction word. Unknown encodings -> op '.long'.
++    An Ins is never changed after decoding, so equal words share one: a
++    program decodes each distinct word once (a game's code repeats most)."""
++    i = _DECODED.get(w)
++    if i is None:
++        i = _DECODED[w] = _decode(w)
++    return i
++
++
++def _decode(w):
+     op = w >> 26
+     D, A, B, C = (w >> 21) & 31, (w >> 16) & 31, (w >> 11) & 31, (w >> 6) & 31
+     rc = w & 1
+diff --git a/recomp/__main__.py b/recomp/__main__.py
+index db1b158..46861e8 100644
+--- a/recomp/__main__.py
++++ b/recomp/__main__.py
+@@ -24,7 +24,7 @@ import argparse
+ import os
+ import time
+ 
+-from .. import cw
++from .. import cw, ppc
+ from ..dol import Image
+ from . import emit as E
+ from .program import Program
+@@ -293,9 +293,16 @@ endif()
+     log("\n".join(report))
+ 
+ 
++_TEXTS = {}
++
++
+ def _text(ins, a):
+-    from .. import ppc
+-    return ppc.text(ins, a)
++    # the comment's disassembly: by word, except branches (their target is relative)
++    key = (ins.word, a) if ins.op in ("b", "bc") else ins.word
++    t = _TEXTS.get(key)
++    if t is None:
++        t = _TEXTS[key] = ppc.text(ins, a)
++    return t
+ 
+ 
+ def main():
+diff --git a/recomp/discover.py b/recomp/discover.py
+index 5131fba..731362e 100644
+--- a/recomp/discover.py
++++ b/recomp/discover.py
+@@ -191,14 +191,53 @@ def discover(img, seeds=(), log=print):
+         if a < hi:
+             strong.add(a)
+     pointers = _data_pointers(img, code)
+-    rounds, cache = 0, {}
++    # Rounds of steps 2-3 to the fixed point. A round's new seeds only change
++    # the units they fall in (a unit's walk never goes past its end, which is
++    # a cut for any start inside it), so each round re-splits just those and
++    # scans just the units it has not scanned yet: the cuts of the others are
++    # already seeds. Same units, entries and seeds as recomputing them all.
++    rounds, cache = 1, {}
++    walk = _Walker(code)
++    starts = sorted(strong)
++    units, inner = walk.units(starts, 0, len(starts))
++    fresh = units
+     while True:
+-        rounds += 1
+-        units, inner = _units(code, strong)
+-        new, reached_all = _unreached(code, units, inner, cache, pointers)
+-        if not new - strong:
++        new = set()
++        inner_sorted = sorted(inner)
++        for s, e in fresh:
++            ent = tuple(inner_sorted[bisect.bisect_left(inner_sorted, s):bisect.bisect_left(inner_sorted, e)])
++            key = (s, e, ent)
++            if key not in cache:
++                cache[key] = _unit_scan(code, s, e, ent, pointers)
++                new |= cache[key][0]
++        new -= strong
++        if not new:
+             break
++        rounds += 1
+         strong |= new
++        starts = sorted(strong)
++        # the units holding new seeds, re-split; the entries inside them, redone
++        unit_starts = [u[0] for u in units]
++        hit = sorted(set(bisect.bisect_right(unit_starts, a) - 1 for a in new))
++        out, fresh, prev = [], [], 0
++        for k in hit:
++            s, e = units[k]
++            out.extend(units[prev:k])
++            for a in [x for x in inner if s <= x < e]:
++                inner.discard(a)
++            lo, hi = bisect.bisect_left(starts, s), bisect.bisect_left(starts, e)
++            part, part_inner = walk.units(starts, lo, hi)
++            out.extend(part)
++            fresh.extend(part)
++            inner |= part_inner
++            prev = k + 1
++        out.extend(units[prev:])
++        units = out
++    reached_all = set()
++    inner_sorted = sorted(inner)
++    for s, e in units:
++        ent = tuple(inner_sorted[bisect.bisect_left(inner_sorted, s):bisect.bisect_left(inner_sorted, e)])
++        reached_all |= cache[(s, e, ent)][1]
+     unreached_ptrs = sorted(p for p in pointers if p not in reached_all and p not in strong)
+     log(f"discover: {len(units)} units, {len(inner)} inner entries, {len(strong)} seeds, "
+         f"{rounds} rounds, {len(pointers)} data pointers into code "
+@@ -206,48 +245,54 @@ def discover(img, seeds=(), log=print):
+     return units, inner
+ 
+ 
+-def _units(code, strong):
+-    starts = sorted(strong)
+-    units, inner = [], set()
+-    i = 0
+-    while i < len(starts):
+-        s = starts[i]
+-        seg_end = code.segment_end(s)
+-        j = i + 1
+-        while True:
+-            end = starts[j] if j < len(starts) and starts[j] < seg_end else seg_end
+-            # the last code word before `end`
+-            a = end - 4
+-            while a >= s and not code.is_code(a):
+-                a -= 4
+-            if end == seg_end or a < s or _terminates(code.ins[a]):
+-                break
+-            inner.add(starts[j])                 # falls through: merge
+-            j += 1
+-        # trim trailing padding
+-        e = end
+-        while e - 4 >= s and code.words.get(e - 4, 0) == 0:
+-            e -= 4
+-        units.append((s, max(e, s + 4)))
+-        i = j
+-    return units, inner
+-
+-
+-def _unreached(code, units, inner, cache, pointers=frozenset()):
+-    """New seeds: in each unit, the first code word of a run that nothing in
+-    the unit reaches, provided no branch crosses it (a clean cut). Unreached
+-    code that branches cross is dead code of the function around it."""
+-    new, reached_all = set(), set()
+-    inner_sorted = sorted(inner)
+-    for s, e in units:
+-        ent = tuple(inner_sorted[bisect.bisect_left(inner_sorted, s):bisect.bisect_left(inner_sorted, e)])
+-        key = (s, e, ent)
+-        if key not in cache:
+-            cache[key] = _unit_scan(code, s, e, ent, pointers)
+-        cuts, seen = cache[key]
+-        new |= cuts
+-        reached_all |= seen
+-    return new, reached_all
++class _Walker:
++    """Step 2 on a slice of the sorted starts, with the per-address facts it
++    needs looked up once."""
++
++    def __init__(self, code):
++        self.code = code
++        self.seg = {}
++        self.last = {}
++
++    def seg_end(self, s):
++        e = self.seg.get(s)
++        if e is None:
++            e = self.seg[s] = self.code.segment_end(s)
++        return e
++
++    def last_code(self, end, s):
++        """The last code word before `end`, or one below `s` if none from s."""
++        a = end - 4
++        code = self.code
++        while a >= s and not code.is_code(a):
++            a -= 4
++        return a
++
++    def units(self, starts, lo, hi):
++        """Units of starts[lo:hi]: each runs to the next start it does not fall
++        through into; the last of the slice ends where the slice's last unit
++        ended (a cut, or its segment's end)."""
++        code = self.code
++        units, inner = [], set()
++        n = len(starts)
++        i = lo
++        while i < hi:
++            s = starts[i]
++            seg_end = self.seg_end(s)
++            j = i + 1
++            while True:
++                end = starts[j] if j < n and starts[j] < seg_end else seg_end
++                a = self.last_code(end, s)
++                if end == seg_end or a < s or _terminates(code.ins[a]):
++                    break
++                inner.add(starts[j])             # falls through: merge
++                j += 1
++            e = end
++            while e - 4 >= s and code.words.get(e - 4, 0) == 0:
++                e -= 4
++            units.append((s, max(e, s + 4)))
++            i = j
++        return units, inner
+ 
+ 
+ def _unit_scan(code, s, e, ent, pointers=frozenset()):

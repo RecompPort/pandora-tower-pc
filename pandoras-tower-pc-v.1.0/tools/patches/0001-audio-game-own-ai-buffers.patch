@@ -1,0 +1,98 @@
+diff --git a/runtime/ax.cpp b/runtime/ax.cpp
+index dc97745..2aa7561 100644
+--- a/runtime/ax.cpp
++++ b/runtime/ax.cpp
+@@ -25,6 +25,7 @@
+ // dsp_coef.bin has them (ax_load_coefs). Without it the resampler is linear.
+ #include "rt.h"
+ #include <algorithm>
++#include <atomic>
+ #include <cstring>
+ #include <cstdlib>
+ 
+@@ -405,9 +406,19 @@ void compressor(uint16_t threshold, uint16_t release_frames, uint32_t table) {
+     }
+ }
+ 
++// Where AX writes its frames for the AI: the last two L/R output buffers, as
++// physical addresses (AX double-buffers). hw.cpp tells AX's blocks from a
++// game's own by them (ax_is_output).
++std::atomic<uint32_t> out_lr[2] = {0, 0};
++void note_output(uint32_t lr) {
++    uint32_t p = lr & 0x1FFFFFE0u;
++    if (p != out_lr[0].load()) { out_lr[1] = out_lr[0].load(); out_lr[0] = p; }
++}
++
+ // the frame's result: surround (and aux C in DPL2 mode) as 32-bit samples,
+ // and main L/R clamped to 16 bits, interleaved right then left, for the AI
+ void output(uint32_t lr_addr, uint32_t surround_addr, uint16_t volume, bool dpl2) {
++    note_output(lr_addr);
+     uint16_t ramp[N];
+     volume_ramp(ramp, last_main_volume, volume);
+     last_main_volume = volume;
+@@ -576,6 +587,7 @@ void gc_command_list(uint32_t addr) {
+         }
+         case 0x0E: {                                 // OUTPUT: surround as 32-bit, L/R clamped, right then left
+             uint32_t surround = next32(), lr = next32();
++            note_output(lr);
+             upload(surround, mix[MS], NGC);
+             uint32_t o = dsp_virt(lr);
+             for (int i = 0; i < NGC; ++i) {
+@@ -633,6 +645,12 @@ void gc_command_list(uint32_t addr) {
+ 
+ }  // namespace
+ 
++bool ax_output_known() { return out_lr[0].load() != 0; }
++bool ax_is_output(uint32_t phys) {
++    uint32_t p = phys & 0x1FFFFFE0u;
++    return p == out_lr[0].load() || p == out_lr[1].load();
++}
++
+ bool ax_load_coefs(const char* dir) {
+     std::string p = std::string(dir) + "/dsp_coef.bin";
+     FILE* f = std::fopen(p.c_str(), "rb");
+diff --git a/runtime/hw.cpp b/runtime/hw.cpp
+index c53d227..61b9761 100644
+--- a/runtime/hw.cpp
++++ b/runtime/hw.cpp
+@@ -272,14 +272,23 @@ uint64_t ai_frames_then = ~0ull;                      // AX frames mixed when th
+ // interrupt for it: AX marks the DSP free there, and at an AI interrupt that
+ // comes first it skips the frame (on the console the DSP is done long before
+ // the next block, never so).
++// A block from a buffer AX does not write is the game's own: a game may mix
++// in its AI callback and point the DMA at its own buffers (Pandora's Tower,
++// for its streams, calling AX's callback only when it wants AX's voices too),
++// and such a block has no AX frame to wait for.
++uint32_t ai_dma_addr() {
++    return (store_read(0xCC005030, 2) << 16 | store_read(0xCC005032, 2)) & 0x1FFFFFE0u;
++}
+ bool ai_frame_ready() {
+-    return dsp_ucode != Ucode::AX || (dsp_frames != ai_frames_then && !(dsp_cr & DSP_DSPINT));
++    if (dsp_ucode != Ucode::AX) return true;
++    if (dsp_frames != ai_frames_then && !(dsp_cr & DSP_DSPINT)) return true;
++    return ax_output_known() && !ax_is_output(ai_dma_addr());
+ }
+ void ai_dma_block() {                                // a block starts: its samples play, interrupt
+     uint16_t ctl = (uint16_t)store_read(0xCC005036, 2);
+     uint32_t rate = (ai_cr & 0x40) ? 32000 : 48000;  // AICR bit 6: DMA sample rate
+     uint64_t bytes = (uint64_t)(ctl & 0x7FFF) * 32;
+-    uint32_t addr = (store_read(0xCC005030, 2) << 16 | store_read(0xCC005032, 2)) & 0x1FFFFFE0u;
++    uint32_t addr = ai_dma_addr();
+     // AX mixes one frame per block, in the guest's AI interrupt. The clock
+     // waits for it (ai_frame_ready); if the guest stays away past that, the
+     // AI would play the previous frame again, a 3 ms buzz: such a block is
+diff --git a/runtime/rt.h b/runtime/rt.h
+index 75fec5e..4422551 100644
+--- a/runtime/rt.h
++++ b/runtime/rt.h
+@@ -107,6 +107,10 @@ void wpad_filter_classic(int chan, ClassicState& s);  // the port's filter, if i
+ 
+ // ---- audio (ax.cpp, audio.cpp) --------------------------------------------------------
+ void ax_command_list(uint32_t addr);               // the AX micro-code: mix one frame
++// AX's last two output buffers for the AI (physical): a block from any other
++// buffer is the game's own mix, with no AX frame to wait for
++bool ax_output_known();
++bool ax_is_output(uint32_t phys);
+ uint8_t aram_read(uint32_t addr);                  // the GameCube's ARAM (hw.cpp), where its AX reads samples
+ bool ax_load_coefs(const char* dir);               // dsp_coef.bin: the polyphase resampler's table
+ void audio_init(bool enabled);                     // the host's audio device (SDL3); false: none

@@ -1,0 +1,397 @@
+diff --git a/runtime/video.cpp b/runtime/video.cpp
+index c1834b5..886d63f 100644
+--- a/runtime/video.cpp
++++ b/runtime/video.cpp
+@@ -23,6 +23,7 @@
+ #include <cstdlib>
+ #include <chrono>
+ #include <cmath>
++#include <memory>
+ #include <condition_variable>
+ #include <cstring>
+ #include <deque>
+@@ -818,6 +819,213 @@ void interp_frame() {
+     sig_cur.clear();
+ }
+ 
++// ---- frame interpolation (WIIKIT_INTERP=1) ------------------------------------------------------
++// The game's frames are kept and drawn again at the screen's own rate: frame
++// B at time t (0 to 1 over the time between it and the frame A before it) is
++// drawn with each draw's matrices, and its vertices if they changed, at
++// A + (B - A) * t, the draw paired with A's as the diagnostic above pairs them.
++// What shows runs one game frame behind. With it on, the record is not drawn
++// as it comes: each frame is kept (its record buffers, the state it starts
++// from, and for each draw its key and matrices), and only the replays draw.
++// Draw-done is still told at once and textures still upload as they come.
++constexpr int kSnap = 0x100 + 0x60 + 7;           // XF words kept per draw: matrices, normal matrices, projection
++struct IDraw { uint64_t key, verts; const uint8_t* vtx; uint32_t pieces; int pm; };
++struct IFrame {
++    std::vector<std::vector<uint8_t>> chunks;
++    std::vector<IDraw> draws;
++    std::vector<uint32_t> xfs;
++    std::vector<int> pair;                         // per draw: its pair in the frame before, or -1
++    bool cut = true;                               // under half paired: not blended
++    uint64_t id = 0;
++    Clock::time_point when;
++    uint32_t bp0[0x100], xf0[0x1058];              // the state the frame starts from
++    uint64_t maps0[8];
++    int32_t reg0[4][4], konst0[4][4];
++};
++bool interp_on = false, replaying = false, frame_ended = false;
++std::unique_ptr<IFrame> fr_prev, fr_last, fr_cur;
++uint64_t frame_ids = 0;
++IFrame* rp_a = nullptr;
++IFrame* rp_b = nullptr;
++float rp_t = 1.0f;
++size_t rp_k = 0;
++
++uint64_t draw_key(uint8_t prim, uint8_t fl, uint32_t pieces, const uint8_t* q, uint64_t& vh, int& pm) {
++    uint64_t count = 0;
++    vh = 1;
++    pm = -1;
++    for (uint32_t i = 0; i < pieces; ++i) {
++        uint32_t n;
++        std::memcpy(&n, q, 4);
++        q += 4;
++        if (pm < 0 && n) pm = q[offsetof(GVtx, mtx)] & 63;
++        vh = hash_bytes(q, (size_t)n * sizeof(GVtx), vh);
++        q += (size_t)n * sizeof(GVtx);
++        count += n;
++    }
++    uint64_t key = mix64(mix64(mix64(prim, fl), count), bp[0x00]);
++    for (int m = 0; m < 8; ++m) key = mix64(key, map_src[m]);
++    for (int r = 0x28; r < 0x30; ++r) key = mix64(key, bp[r]);
++    return key;
++}
++
++inline float as_f(uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; }
++inline uint32_t as_u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
++
++std::unique_ptr<IFrame> new_frame() {                // starting from the state as it is now
++    auto f = std::make_unique<IFrame>();
++    std::memcpy(f->bp0, bp, sizeof bp);
++    std::memcpy(f->xf0, xf, sizeof xf);
++    std::memcpy(f->maps0, map_src, sizeof map_src);
++    std::memcpy(f->reg0, tev_reg, sizeof tev_reg);
++    std::memcpy(f->konst0, tev_konst, sizeof tev_konst);
++    return f;
++}
++
++void interp_keep(uint8_t prim, uint8_t fl, const uint8_t* q, uint32_t pieces) {
++    IFrame& f = *fr_cur;
++    uint64_t vh;
++    int pm;
++    uint64_t key = draw_key(prim, fl, pieces, q, vh, pm);
++    f.draws.push_back(IDraw{key, vh, q, pieces, pm});
++    size_t o = f.xfs.size();
++    f.xfs.resize(o + kSnap);
++    std::memcpy(&f.xfs[o], &xf[0], 0x100 * 4);
++    std::memcpy(&f.xfs[o + 0x100], &xf[0x400], 0x60 * 4);
++    std::memcpy(&f.xfs[o + 0x160], &xf[0x1020], 7 * 4);
++}
++
++void release_frame(std::unique_ptr<IFrame>& f) {    // its buffers back to the game's side
++    if (!f) return;
++    std::lock_guard<std::mutex> lk(qmx);
++    for (auto& c : f->chunks) {
++        c.clear();
++        if (spare.size() < 16) spare.push_back(std::move(c));
++    }
++    f.reset();
++}
++
++void interp_finish() {                               // fr_cur is a whole frame: pair it, keep it
++    IFrame& b = *fr_cur;
++    b.when = Clock::now();
++    b.id = ++frame_ids;
++    b.pair.assign(b.draws.size(), -1);
++    if (fr_last) {
++        // among the draws of the frame before with the same key (the same model, the
++        // same textures), the one whose position matrix is nearest: a game may draw
++        // its copies of a model in another order each frame (sorted by depth). A pair
++        // that moved more than a third of its distance to the eye in one frame is no
++        // pair (another copy, or the camera cut): it is drawn as it is.
++        const IFrame& a = *fr_last;
++        auto trans = [](const IFrame& f, size_t d, float out[3]) {
++            int pm = f.draws[d].pm < 0 ? 0 : f.draws[d].pm;
++            const uint32_t* x = &f.xfs[d * kSnap + (size_t)pm * 4];
++            out[0] = as_f(x[3]); out[1] = as_f(x[7]); out[2] = as_f(x[11]);
++        };
++        std::unordered_map<uint64_t, std::vector<int>> by_key;
++        for (int i = 0; i < (int)a.draws.size(); ++i) by_key[a.draws[i].key].push_back(i);
++        size_t paired = 0;
++        for (size_t k = 0; k < b.draws.size(); ++k) {
++            auto it = by_key.find(b.draws[k].key);
++            if (it == by_key.end() || it->second.empty()) continue;
++            std::vector<int>& cand = it->second;
++            float tb[3];
++            trans(b, k, tb);
++            size_t best = 0;
++            float best_d = 1e30f;
++            for (size_t c = 0; c < cand.size() && c < 16; ++c) {
++                float ta[3];
++                trans(a, (size_t)cand[c], ta);
++                float d = (ta[0] - tb[0]) * (ta[0] - tb[0]) + (ta[1] - tb[1]) * (ta[1] - tb[1]) + (ta[2] - tb[2]) * (ta[2] - tb[2]);
++                if (d < best_d) { best_d = d; best = c; }
++            }
++            float ta[3];
++            trans(a, (size_t)cand[best], ta);
++            float ra = ta[0] * ta[0] + ta[1] * ta[1] + ta[2] * ta[2], rb = tb[0] * tb[0] + tb[1] * tb[1] + tb[2] * tb[2];
++            bool sane = std::isfinite(best_d) && (best_d <= 0.25f || best_d <= std::max(ra, rb) / 9.0f);
++            if (sane) b.pair[k] = cand[best];
++            cand.erase(cand.begin() + (std::ptrdiff_t)best);
++            if (sane) ++paired;
++        }
++        b.cut = paired * 2 < b.draws.size();
++    }
++    release_frame(fr_prev);
++    fr_prev = std::move(fr_last);
++    fr_last = std::move(fr_cur);
++    fr_cur = new_frame();
++}
++
++
++void upload_xf(uint32_t a, uint32_t n) { glNamedBufferSubData(xf_ubo, a * 4, n * 4, &xf[a]); }
++
++// one draw of the frame being replayed, blended with its pair in the frame before
++void interp_draw(uint8_t prim, uint8_t fl, const uint8_t* p, uint32_t pieces) {
++    IFrame& b = *rp_b;
++    size_t k = rp_k++;
++    if (!rp_a || rp_t >= 1.0f || k >= b.pair.size() || b.pair[k] < 0) { draw(prim, fl, p, pieces); return; }
++    IFrame& a = *rp_a;
++    int j = b.pair[k];
++    const uint32_t* xa = &a.xfs[(size_t)j * kSnap];
++    static uint32_t saved[kSnap];
++    const float t = rp_t;
++    auto blend = [&](uint32_t at, int n, int s) {
++        for (int i = 0; i < n; ++i) {
++            uint32_t& w = xf[at + i];
++            saved[s + i] = w;
++            float fa = as_f(xa[s + i]), fb = as_f(w), v = fa + (fb - fa) * t;
++            if (std::isfinite(v)) w = as_u(v);
++        }
++    };
++    blend(0, 0x100, 0);
++    blend(0x400, 0x60, 0x100);
++    bool same_proj = xa[0x160 + 6] == xf[0x1026];        // perspective or orthographic in both
++    if (same_proj) blend(0x1020, 6, 0x160);
++    upload_xf(0, 0x100);
++    upload_xf(0x400, 0x60);
++    if (same_proj) upload_xf(0x1020, 6);
++    // the vertices, if they changed (same count, piece by piece): positions and normals
++    const uint8_t* verts = p;
++    static std::vector<uint8_t> vbuf;
++    const IDraw& da = a.draws[j];
++    if (da.verts != b.draws[k].verts && da.pieces == pieces) {
++        const uint8_t* qa = da.vtx;
++        const uint8_t* qb = p;
++        size_t total = 0;
++        bool ok = true;
++        for (uint32_t i = 0; i < pieces && ok; ++i) {
++            uint32_t na, nb;
++            std::memcpy(&na, qa + total, 4);
++            std::memcpy(&nb, qb + total, 4);
++            ok = na == nb;
++            total += 4 + (size_t)nb * sizeof(GVtx);
++        }
++        if (ok) {
++            vbuf.assign(p, p + total);
++            size_t o = 0;
++            for (uint32_t i = 0; i < pieces; ++i) {
++                uint32_t n;
++                std::memcpy(&n, &vbuf[o], 4);
++                o += 4;
++                for (uint32_t v = 0; v < n; ++v, o += sizeof(GVtx)) {
++                    float pa[6], pb[6];
++                    std::memcpy(pa, qa + o, sizeof pa);           // pos[3], nrm[3]
++                    std::memcpy(pb, &vbuf[o], sizeof pb);
++                    for (int c = 0; c < 6; ++c) pb[c] = pa[c] + (pb[c] - pa[c]) * t;
++                    std::memcpy(&vbuf[o], pb, sizeof pb);
++                }
++            }
++            verts = vbuf.data();
++        }
++    }
++    draw(prim, fl, verts, pieces);
++    std::memcpy(&xf[0], &saved[0], 0x100 * 4);
++    std::memcpy(&xf[0x400], &saved[0x100], 0x60 * 4);
++    if (same_proj) std::memcpy(&xf[0x1020], &saved[0x160], 6 * 4);
++    upload_xf(0, 0x100);
++    upload_xf(0x400, 0x60);
++    if (same_proj) upload_xf(0x1020, 6);
++}
++
+ // ---- the record -----------------------------------------------------------------------------------
+ template <class T> T rd(const uint8_t*& p) { T v; std::memcpy(&v, p, sizeof v); p += sizeof v; return v; }
+ 
+@@ -869,7 +1077,12 @@ void exec(const std::vector<uint8_t>& data) {
+     const uint8_t* end = p + data.size();
+     while (p < end) {
+         switch (*p++) {
+-        case VC_BP: bp_set(rd<uint32_t>(p)); break;
++        case VC_BP: {
++            uint32_t v = rd<uint32_t>(p);
++            if (interp_on && !replaying && (v >> 24) == 0x52) bp[0x52] = v & 0xFFFFFF;   // copies: in the replays
++            else bp_set(v);
++            break;
++        }
+         case VC_XF: {
+             uint16_t a = rd<uint16_t>(p), n = rd<uint16_t>(p);
+             std::memcpy(&xf[a], p, 4u * n);
+@@ -881,8 +1094,10 @@ void exec(const std::vector<uint8_t>& data) {
+         case VC_DRAW: {
+             uint8_t prim = rd<uint8_t>(p), fl = rd<uint8_t>(p);
+             uint32_t pieces = rd<uint32_t>(p);
+-            draw(prim, fl, p, pieces);
+-            if (interp_diag) interp_note(prim, fl, pieces, p);
++            if (replaying) interp_draw(prim, fl, p, pieces);
++            else if (interp_on) interp_keep(prim, fl, p, pieces);
++            else draw(prim, fl, p, pieces);
++            if (interp_diag && !replaying) interp_note(prim, fl, pieces, p);
+             for (uint32_t i = 0; i < pieces; ++i) {
+                 uint32_t n = rd<uint32_t>(p);
+                 p += (size_t)n * sizeof(GVtx);
+@@ -893,6 +1108,11 @@ void exec(const std::vector<uint8_t>& data) {
+             uint8_t m = rd<uint8_t>(p);
+             uint32_t id = rd<uint32_t>(p);
+             int w = rd<uint16_t>(p), h = rd<uint16_t>(p), levels = rd<uint8_t>(p);
++            if (replaying) {                                   // uploaded when the frame came
++                for (int l = 0; l < levels; ++l) p += (size_t)std::max(1, w >> l) * std::max(1, h >> l) * 4;
++                map_src[m] = id;
++                break;
++            }
+             Tex& t = texs[id];
+             ensure_tex(t, w, h, levels);
+             for (int l = 0; l < levels; ++l) {
+@@ -905,13 +1125,52 @@ void exec(const std::vector<uint8_t>& data) {
+         }
+         case VC_TEXBIND: { uint8_t m = rd<uint8_t>(p); map_src[m] = rd<uint32_t>(p); break; }
+         case VC_TEXEFB: { uint8_t m = rd<uint8_t>(p); map_src[m] = 1ull << 32 | rd<uint32_t>(p); break; }
+-        case VC_FRAME: if (interp_diag) interp_frame(); break;
+-        case VC_DRAWDONE: gx_draw_done_reached(); break;
++        case VC_FRAME:
++            if (replaying) break;
++            if (interp_diag) interp_frame();
++            if (interp_on) frame_ended = true;
++            break;
++        case VC_DRAWDONE: if (!replaying) gx_draw_done_reached(); break;
+         default: rt_die("video: bad record byte %02X", p[-1]);
+         }
+     }
+ }
+ 
++// the last frame drawn again at time t, from the state it started from;
++// the state of the frame coming in, part-way through maybe, put back after
++void interp_replay(float t) {
++    IFrame& b = *fr_last;
++    static uint32_t bp_now[0x100], xf_now[0x1058];
++    static uint64_t maps_now[8];
++    static int32_t reg_now[4][4], konst_now[4][4];
++    std::memcpy(bp_now, bp, sizeof bp);
++    std::memcpy(xf_now, xf, sizeof xf);
++    std::memcpy(maps_now, map_src, sizeof map_src);
++    std::memcpy(reg_now, tev_reg, sizeof tev_reg);
++    std::memcpy(konst_now, tev_konst, sizeof tev_konst);
++    std::memcpy(bp, b.bp0, sizeof bp);
++    std::memcpy(xf, b.xf0, sizeof xf);
++    std::memcpy(map_src, b.maps0, sizeof map_src);
++    std::memcpy(tev_reg, b.reg0, sizeof tev_reg);
++    std::memcpy(tev_konst, b.konst0, sizeof tev_konst);
++    xf_lo = 0;
++    xf_hi = 0x1058;
++    replaying = true;
++    rp_a = fr_prev && !b.cut ? fr_prev.get() : nullptr;
++    rp_b = &b;
++    rp_t = t;
++    rp_k = 0;
++    for (const auto& c : b.chunks) exec(c);
++    replaying = false;
++    std::memcpy(bp, bp_now, sizeof bp);
++    std::memcpy(xf, xf_now, sizeof xf);
++    std::memcpy(map_src, maps_now, sizeof map_src);
++    std::memcpy(tev_reg, reg_now, sizeof tev_reg);
++    std::memcpy(tev_konst, konst_now, sizeof tev_konst);
++    xf_lo = 0;
++    xf_hi = 0x1058;
++}
++
+ // ---- presenting -----------------------------------------------------------------------------------
+ uint32_t crc_table[256];
+ uint32_t crc32(const uint8_t* p, size_t n, uint32_t c = 0xFFFFFFFFu) {
+@@ -1491,7 +1750,7 @@ void present() {
+     glColorMask(1, 1, 1, 1);
+     glClearColor(0, 0, 0, 1);
+     glClear(GL_COLOR_BUFFER_BIT);
+-    auto it = xfbs.find(xfb_addr.load());
++    auto it = interp_on ? xfbs.find(last_xfb) : xfbs.find(xfb_addr.load());   // interpolating: the replay's
+     if (it == xfbs.end()) it = xfbs.find(last_xfb);
+     if (it != xfbs.end() && ww > 0 && wh > 0) {
+         const Tex& t = it->second;
+@@ -1720,7 +1979,7 @@ void video_run(const char* title) {
+     SDL_GLContext ctx = SDL_GL_CreateContext(win);
+     if (!ctx) rt_die("video: no OpenGL 4.5 context: %s", SDL_GetError());
+     SDL_GL_MakeCurrent(win, ctx);
+-    SDL_GL_SetSwapInterval(0);                   // VI paces the presents
++    SDL_GL_SetSwapInterval(0);                   // VI paces the presents (interpolating: the screen, below)
+     if (!gl_load()) rt_die("video: OpenGL functions missing");
+     rt_log("video: %s, %s", (const char*)glGetString(GL_RENDERER), (const char*)glGetString(GL_VERSION));
+     {
+@@ -1733,6 +1992,12 @@ void video_run(const char* title) {
+             rt_log("video: shaders linked asynchronously (WIIKIT_ASYNC_SHADERS=0 to wait for them)");
+         }
+     }
++    if (const char* d = std::getenv("WIIKIT_INTERP"); d && d[0] == '1') {
++        interp_on = true;
++        fr_cur = new_frame();
++        if (!SDL_GL_SetSwapInterval(-1)) SDL_GL_SetSwapInterval(1);       // the screen's own rate (adaptive if it can)
++        rt_log("video: frame interpolation on (the screen's refresh rate; one game frame behind)");
++    }
+     if (const char* d = std::getenv("WIIKIT_INTERP_DIAG"); d && d[0] == '1') {
+         interp_diag = true;
+         rt_log("video: frame-interpolation diagnostic on (a line every 300 frames)");
+@@ -1848,7 +2113,14 @@ void video_run(const char* title) {
+             auto te = Clock::now();
+             exec(c.data);
+             if (g_vperf_on) g_vperf.draw += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - te).count();
+-            {
++            if (interp_on) {                                    // the buffer stays with its frame
++                {
++                    std::lock_guard<std::mutex> lk(qmx);
++                    q_frames -= c.frames;
++                }
++                fr_cur->chunks.push_back(std::move(c.data));
++                if (frame_ended) { frame_ended = false; interp_finish(); }
++            } else {
+                 std::lock_guard<std::mutex> lk(qmx);
+                 q_frames -= c.frames;
+                 c.data.clear();
+@@ -1856,7 +2128,28 @@ void video_run(const char* title) {
+             }
+             q_space.notify_all();
+             busy = true;
+-            if (retraces.load() != seen) break;
++            if (!interp_on && retraces.load() != seen) break;
++        }
++        if (interp_on) {
++            // once per refresh of the screen (the swap waits for it): the last
++            // frame at the time reached since it came, the one before blended in
++            if (fr_last) {
++                static uint64_t shown = 0;
++                float t = 1.0f;
++                if (fr_prev && !fr_last->cut) {
++                    double dt = std::chrono::duration<double>(fr_last->when - fr_prev->when).count();
++                    dt = std::clamp(dt, 0.008, 0.05);
++                    t = (float)std::min(1.0, std::chrono::duration<double>(Clock::now() - fr_last->when).count() / dt);
++                }
++                auto tp = Clock::now();
++                if (t < 1.0f || shown != fr_last->id) interp_replay(t);
++                shown = t < 1.0f ? 0 : fr_last->id;
++                present();
++                if (g_vperf_on) g_vperf.present += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - tp).count();
++                busy = true;
++            }
++            if (!busy) SDL_WaitSemaphoreTimeout(wake, 2);
++            continue;
+         }
+         uint32_t r = retraces.load();
+         if (r != seen) {

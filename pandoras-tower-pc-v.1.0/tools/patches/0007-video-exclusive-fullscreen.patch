@@ -1,0 +1,19 @@
+diff --git a/runtime/video.cpp b/runtime/video.cpp
+index 886d63f..b8220ce 100644
+--- a/runtime/video.cpp
++++ b/runtime/video.cpp
+@@ -1976,6 +1976,14 @@ void video_run(const char* title) {
+     if (opt.fullscreen) wflags |= SDL_WINDOW_FULLSCREEN;
+     win = SDL_CreateWindow(title, w0, h0, wflags);
+     if (!win) rt_die("video: SDL_CreateWindow: %s", SDL_GetError());
++    // WIIKIT_FULLSCREEN=exclusive: fullscreen with the screen to itself, at the
++    // desktop's resolution and refresh rate, instead of the borderless window
++    if (const char* fm = std::getenv("WIIKIT_FULLSCREEN"); fm && SDL_strcasecmp(fm, "exclusive") == 0) {
++        const SDL_DisplayMode* dm = SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(win));
++        if (dm && SDL_SetWindowFullscreenMode(win, dm))
++            rt_log("video: exclusive fullscreen, %dx%d at %.0f Hz", dm->w, dm->h, (double)dm->refresh_rate);
++        else rt_log("video: no exclusive fullscreen (%s): borderless", SDL_GetError());
++    }
+     SDL_GLContext ctx = SDL_GL_CreateContext(win);
+     if (!ctx) rt_die("video: no OpenGL 4.5 context: %s", SDL_GetError());
+     SDL_GL_MakeCurrent(win, ctx);

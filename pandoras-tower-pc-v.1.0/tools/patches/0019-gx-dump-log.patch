@@ -1,0 +1,13 @@
+diff --git a/runtime/gx.cpp b/runtime/gx.cpp
+index 93c3632..ddfda3b 100644
+--- a/runtime/gx.cpp
++++ b/runtime/gx.cpp
+@@ -561,6 +561,8 @@ void bind_map(int m) {
+     std::string tname;
+     if (upload && (tex_dump_dir || tex_packs)) tname = tex_name(fmt, w, h, src, th);
+     if (upload && tex_dump_dir) {
++        static bool told = false;
++        if (!told) { told = true; rt_log("gx: dumping each texture once to %s", tex_dump_dir); }
+         static std::set<std::string> dumped;
+         if (dumped.insert(tname).second) {
+             std::vector<uint8_t> px((size_t)w * h * 4);

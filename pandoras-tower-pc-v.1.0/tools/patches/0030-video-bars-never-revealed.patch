@@ -1,0 +1,76 @@
+diff --git a/runtime/video.cpp b/runtime/video.cpp
+index 4bad5b3..5bddd34 100644
+--- a/runtime/video.cpp
++++ b/runtime/video.cpp
+@@ -2107,9 +2107,43 @@ void find_letterbox(const Tex& t) {
+         if (n++ < 12) rt_log("video: black bars cut (%s): top and bottom %.1f%%, sides %.1f%%", where, target_v * 100, target_h * 100);
+     };
+     int hint = movie_hint.load();
++    // The crop never goes while bars are still shown (a zoom out onto black bars):
++    // when a movie or a loading screen is over, the crop stays until the picture
++    // about to be shown has no bars, read from that very picture, or is all black
++    // (then the change can't be seen); at most five seconds (the game's own picture
++    // too dark to tell), so the play's edges are not left cut
++    static bool releasing = false;
++    static int release_frames = 0;
++    auto release_now = [&]() {
++        releasing = false;
++        release_frames = 0;
++        target_v = target_h = 0.0f;
++        letterbox.store(0.0f);
++        pillarbox.store(0.0f);
++    };
+     if (movie_ended.exchange(false)) {                                // the movie is over: back to the whole picture
+-        target_v = target_h = 0.0f; seen_v = seen_h = -1; agree = 0;
++        seen_v = seen_h = -1; agree = 0;
+         movie_locked = loading_locked = false;
++        if (letterbox.load() > 0.0f || pillarbox.load() > 0.0f) { releasing = true; release_frames = 0; }
++        else target_v = target_h = 0.0f;
++    }
++    if (releasing && (hint == 1 || hint == 2)) releasing = false;    // a new movie or loading screen: it decides
++    if (releasing) {
++        std::vector<uint8_t> px((size_t)kLines * (t.h + t.w) * 4);
++        read(px.data());                                              // this picture, before it is shown
++        bool all_dark = true;
++        for (size_t i = 0; i < px.size() && all_dark; i += 4)
++            if (std::max({px[i], px[i + 1], px[i + 2]}) > 24) all_dark = false;
++        char why_v[96], why_h[96];
++        int v = bar_size_edges(px.data(), t.h, kLines, why_v, sizeof why_v);
++        int hz = bar_size_edges(px.data() + (size_t)kLines * t.h * 4, t.w, kLines, why_h, sizeof why_h);
++        if (all_dark || (v == 0 && hz == 0) || ++release_frames > 150) {
++            static int n = 0;
++            if (n++ < 12) rt_log("video: black bars gone: crop off (%s)", all_dark ? "on a black picture" : v == 0 && hz == 0 ? "the picture has none" : "five seconds");
++            release_now();
++        }
++        if (hint == 3) movie_hint.store(0);
++        return;                                                       // until then, the crop as it was
+     }
+     // bars within 1.5 % of those of the loading screens before are theirs: every
+     // loading screen cut alike (12.2 % one time, 12.8 % the next, was a jump)
+@@ -2213,12 +2247,12 @@ void find_letterbox(const Tex& t) {
+     pillarbox.store(target_h);
+     static int ending = 0;
+     if (hint == 3) {                                                  // the loading screen is going: once its bars
+-        if (++ending > 600 || (agree >= 3 && seen_v == 0 && seen_h == 0)) {   // are gone (or ten seconds), done
+-            movie_hint.store(0);
++        if (++ending > 600 || (agree >= 3 && seen_v == 0 && seen_h == 0)) {   // are gone (or ten seconds): the crop
++            movie_hint.store(0);                                          // goes once the picture shown has none
+             loading_locked = false;
+-            target_v = target_h = 0.0f;
+-            letterbox.store(0.0f);
+-            pillarbox.store(0.0f);
++            seen_v = seen_h = -1; agree = 0;
++            releasing = true;
++            release_frames = 0;
+             ending = 0;
+             return;
+         }
+@@ -2246,7 +2280,7 @@ void video_letterbox_hint(int mode) {
+     }
+     movie_hint.store(mode);
+     if (mode == 1 || mode == 2) movie_fresh.store(true);
+-    else { movie_ended.store(true); letterbox.store(0.0f); pillarbox.store(0.0f); }
++    else movie_ended.store(true);                                     // its crop goes when its bars do (find_letterbox)
+ }
+ 
+ namespace {

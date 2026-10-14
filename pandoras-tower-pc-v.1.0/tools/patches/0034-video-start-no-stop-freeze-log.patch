@@ -1,0 +1,229 @@
+diff --git a/runtime/video.cpp b/runtime/video.cpp
+index 97c3670..7bcc489 100644
+--- a/runtime/video.cpp
++++ b/runtime/video.cpp
+@@ -33,6 +33,7 @@
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <vector>
++#include <thread>
+ 
+ #define WIIKIT_GL_DEFINE(T, n) T n = nullptr;
+ WIIKIT_GL_FUNCS(WIIKIT_GL_DEFINE)
+@@ -132,12 +133,15 @@ std::unordered_map<std::string, PendingProgram> pending_by_source;   // being li
+ std::unordered_map<std::string, std::string> pending_key;           // register key -> its source
+ // GL_KHR_parallel_shader_compile: links run in the driver's threads (both modes)
+ bool parallel_links = false;
++// what the renderer is doing now, for the report of a freeze (os.cpp)
++std::atomic<const char*> v_doing{"starting"};
+ // The programs the game has used, by their code (SHADER_CACHE/programas.txt, with
+ // WIIKIT_SHADER_LIST's too): at start, those not in the cache (a fresh cache, or
+ // a new driver) are linked in the driver's threads while the game boots, so the
+ // first time they are drawn they are already there
+ std::unordered_set<std::string> listed;
+ std::vector<std::string> warming;                                  // being linked at start
++std::vector<std::string> to_load;                                  // in the shader cache, to load in the background
+ 
+ struct Counters { uint64_t frames, presents, draws, programs, linked, cached; } cnt;
+ bool dump_ps = false;                              // WIIKIT_SHADERDUMP: log the next uniforms
+@@ -512,7 +516,12 @@ void warm_start() {
+         if (i < own) listed.insert(source);
+         if (programs_by_source.count(source) || pending_by_source.count(source)) continue;
+         uint64_t hash = source_hash(source);
+-        if (GLuint p = load_program(hash)) { programs_by_source.emplace(source, p); ++cnt.cached; ++cached; continue; }
++        std::error_code ec;
++        if (!opt.shader_cache.empty() && std::filesystem::exists(cache_path(hash), ec)) {   // loaded a few a frame (warm_poll)
++            to_load.push_back(source);
++            ++cached;
++            continue;
++        }
+         if (!parallel_links) continue;                       // linking them here would hold the start up
+         size_t cut = source.find('\0');
+         pending_by_source.emplace(source, PendingProgram{link_async(source.substr(0, cut), source.substr(cut + 1)), hash});
+@@ -520,7 +529,7 @@ void warm_start() {
+         ++linking;
+     }
+     if (!all.empty())
+-        rt_log("video: %zu programs known from before: %zu from the shader cache, %zu being linked in the background",
++        rt_log("video: %zu programs known from before: %zu in the shader cache (loaded a few each frame), %zu being linked in the background",
+                all.size(), cached, linking);
+ }
+ 
+@@ -528,6 +537,17 @@ bool poll_pending(const std::string& source, GLuint& out);
+ 
+ // each frame: the programs linked at start that are done join the others
+ void warm_poll() {
++    // the ones in the shader cache: loaded while each frame has 2 ms to spare
++    if (!to_load.empty()) {
++        auto t0 = Clock::now();
++        while (!to_load.empty() && Clock::now() - t0 < std::chrono::milliseconds(2)) {
++            std::string source = std::move(to_load.back());
++            to_load.pop_back();
++            if (programs_by_source.count(source) || pending_by_source.count(source)) continue;
++            if (GLuint p = load_program(source_hash(source))) { programs_by_source.emplace(std::move(source), p); ++cnt.cached; }
++        }
++        if (to_load.empty()) rt_log("video: the programs in the shader cache are all loaded");
++    }
+     if (warming.empty()) return;
+     int done = 0;
+     for (size_t i = 0; i < warming.size() && done < 16;) {
+@@ -541,12 +561,23 @@ void warm_poll() {
+     if (warming.empty()) rt_log("video: the programs known from before are all linked");
+ }
+ 
+-// a program being linked, waited for (waiting for shaders: nothing is skipped)
++// a program being linked, waited for (waiting for shaders: nothing is skipped);
++// three seconds at most: a link the driver never finishes does not freeze the
++// game, the draw is skipped this time and the link goes on
+ GLuint wait_pending(const std::string& source) {
+-    auto q = pending_by_source.find(source);
+-    if (q != pending_by_source.end()) { GLint ok = 0; glGetProgramiv(q->second.p, GL_LINK_STATUS, &ok); }   // waits
++    const char* was = v_doing.exchange("waiting for a shader to link");
++    auto t0 = Clock::now();
+     GLuint p = 0;
+-    while (!poll_pending(source, p)) {}
++    while (!poll_pending(source, p)) {
++        if (Clock::now() - t0 > std::chrono::seconds(3)) {
++            static int told = 0;
++            if (told++ < 5) rt_log("video: a shader took over 3 s to link: its draw skipped meanwhile");
++            v_doing.store(was);
++            return 0;
++        }
++        std::this_thread::sleep_for(std::chrono::microseconds(200));
++    }
++    v_doing.store(was);
+     return p;
+ }
+ 
+@@ -559,6 +590,7 @@ GLuint program_for(uint8_t vflags) {
+         if (!poll_pending(pk->second, p)) {
+             if (async_shaders) return 0;                         // still linking: skip the draw
+             p = wait_pending(pk->second);                        // waiting for shaders: wait for it
++            if (!p && pending_by_source.count(pk->second)) return 0;   // over 3 s: next time
+         }
+         pending_key.erase(pk);
+         programs.emplace(std::move(key), p);
+@@ -576,6 +608,10 @@ GLuint program_for(uint8_t vflags) {
+         remember(source);
+         if (!async_shaders) {
+             GLuint p = wait_pending(source);
++            if (!p && pending_by_source.count(source)) {           // over 3 s: next time
++                pending_key.emplace(std::move(key), std::move(source));
++                return 0;
++            }
+             programs.emplace(std::move(key), p);
+             return p;
+         }
+@@ -2324,7 +2360,7 @@ void find_letterbox(const Tex& t) {
+         char why_v[96], why_h[96];
+         int v = bar_size_edges(px.data(), t.h, kLines, why_v, sizeof why_v);
+         int hz = bar_size_edges(px.data() + (size_t)kLines * t.h * 4, t.w, kLines, why_h, sizeof why_h);
+-        if (v < 0 || hz < 0) {                                        // a dark picture with plain black bars
++        if (v < 0 || hz < 0 || hint == 2) {                           // plain black bars: all five lines black
+             int sv = bar_size(px.data(), t.h, kLines), sh = bar_size(px.data() + (size_t)kLines * t.h * 4, t.w, kLines);
+             if (sv > 0) { v = sv; hz = std::max(0, sh); }
+         }
+@@ -2426,6 +2462,8 @@ void find_letterbox(const Tex& t) {
+ 
+ }  // namespace
+ 
++const char* video_activity() { return v_doing.load(); }
++
+ void video_letterbox_hint(int mode) {
+     if (mode == 3) {                                                  // a loading screen ends: its bars, until they go
+         if (movie_hint.load() == 2) movie_hint.store(3);
+@@ -2439,6 +2477,7 @@ void video_letterbox_hint(int mode) {
+ namespace {
+ 
+ void present() {
++    v_doing.store("presenting a frame");
+     ++cnt.presents;
+     warm_poll();
+     int ww = 0, wh = 0;
+@@ -2564,7 +2603,10 @@ void video_configure(const VideoOptions& o) { opt = o; S = std::max(1, o.scale);
+ VideoPerf g_vperf;
+ bool g_vperf_on = std::getenv("WIIKIT_PERF") != nullptr;
+ 
++static std::atomic<uint64_t> game_frames{0}, video_loops{0};          // the watchdog's heartbeats
++
+ bool video_submit(std::vector<uint8_t>& rec, int frames, int wait_ms) {
++    game_frames.fetch_add((uint64_t)frames, std::memory_order_relaxed);
+     auto t0 = Clock::now();
+     std::unique_lock<std::mutex> lk(qmx);
+     // frames in flight: each one queued is 33 ms more between what the game
+@@ -2667,7 +2709,39 @@ void video_retrace() {
+ }
+ 
+ // ---- the window --------------------------------------------------------------------------------
++// A freeze, in run.err: a thread that watches both sides, the game (its frames
++// coming) and the renderer (its loop going round); one that stops for over
++// 1.5 seconds is written down, with what the renderer was doing, and again
++// when it goes on, with how long it was stopped
++static void watchdog() {
++    uint64_t lg = game_frames.load(), lv = video_loops.load();
++    auto tg = Clock::now(), tv = tg;
++    bool gs = false, vs = false;
++    int told = 0;
++    for (;;) {
++        std::this_thread::sleep_for(std::chrono::milliseconds(250));
++        auto now = Clock::now();
++        uint64_t g = game_frames.load(), v = video_loops.load();
++        if (v != lv) {
++            if (vs && told < 40) { ++told; rt_log("freeze: the renderer went on after %.1f s", std::chrono::duration<double>(now - tv).count()); }
++            lv = v; tv = now; vs = false;
++        } else if (!vs && now - tv > std::chrono::milliseconds(1500)) {
++            vs = true;
++            if (told < 40) { ++told; rt_log("freeze: the renderer has been stopped 1.5 s, %s", v_doing.load()); }
++        }
++        if (g != lg) {
++            if (gs && told < 40) { ++told; rt_log("freeze: the game went on after %.1f s", std::chrono::duration<double>(now - tg).count()); }
++            lg = g; tg = now; gs = false;
++        } else if (!gs && !vs && now - tg > std::chrono::milliseconds(1500)) {
++            gs = true;                                        // the renderer runs: the game itself stopped
++            if (told < 40) { ++told; rt_log("freeze: the game has sent no frame for 1.5 s (the renderer is %s)", v_doing.load()); }
++        }
++    }
++}
++
+ void video_run(const char* title) {
++    static bool dog = false;
++    if (!dog) { dog = true; std::thread(watchdog).detach(); }
+     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) rt_die("video: SDL_Init: %s", SDL_GetError());
+     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
+     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 5);
+@@ -2852,6 +2926,7 @@ void video_run(const char* title) {
+             }
+             if (c.readback) { if (c.copy) copy_readback(c.copy); else efb_readback(); busy = true; continue; }
+             auto te = Clock::now();
++            v_doing.store("drawing the game's frame");
+             prescan(c.data);
+             exec(c.data);
+             if (g_vperf_on) g_vperf.draw += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - te).count();
+@@ -2885,7 +2960,7 @@ void video_run(const char* title) {
+                 }
+                 auto tp = Clock::now();
+                 bool fresh = t < 1.0f || shown != fr_last->id;
+-                if (fresh) interp_replay(t);
++                if (fresh) { v_doing.store("drawing a frame between (interpolation)"); interp_replay(t); }
+                 shown = t < 1.0f ? 0 : fr_last->id;
+                 if (fresh || interp_rate == 0) {                    // the refresh waits; else only new pictures
+                     present();
+@@ -2901,7 +2976,8 @@ void video_run(const char* title) {
+                     if (next > now) SDL_DelayPrecise((Uint64)std::chrono::duration_cast<std::chrono::nanoseconds>(next - now).count());
+                 }
+             }
+-            if (!busy) SDL_WaitSemaphoreTimeout(wake, 2);
++            video_loops.fetch_add(1, std::memory_order_relaxed);
++            if (!busy) { v_doing.store("waiting for the game's next frame"); SDL_WaitSemaphoreTimeout(wake, 2); }
+             continue;
+         }
+         uint32_t r = retraces.load();
+@@ -2912,6 +2988,7 @@ void video_run(const char* title) {
+             if (g_vperf_on) g_vperf.present += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - tp).count();
+             busy = true;
+         }
+-        if (!busy) SDL_WaitSemaphoreTimeout(wake, 5);
++        video_loops.fetch_add(1, std::memory_order_relaxed);
++        if (!busy) { v_doing.store("waiting for the game's next frame"); SDL_WaitSemaphoreTimeout(wake, 5); }
+     }
+ }

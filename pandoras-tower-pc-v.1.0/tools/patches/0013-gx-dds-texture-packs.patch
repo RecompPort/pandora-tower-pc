@@ -1,0 +1,246 @@
+diff --git a/runtime/gl.h b/runtime/gl.h
+index 3d2da4e..7bc7f08 100644
+--- a/runtime/gl.h
++++ b/runtime/gl.h
+@@ -68,6 +68,7 @@
+     X(PFNGLCREATETEXTURESPROC, glCreateTextures)                                                    \
+     X(PFNGLTEXTURESTORAGE2DPROC, glTextureStorage2D)                                                \
+     X(PFNGLTEXTURESUBIMAGE2DPROC, glTextureSubImage2D)                                              \
++    X(PFNGLCOMPRESSEDTEXTURESUBIMAGE2DPROC, glCompressedTextureSubImage2D)                          \
+     X(PFNGLTEXTUREPARAMETERIPROC, glTextureParameteri)                                              \
+     X(PFNGLBINDTEXTUREUNITPROC, glBindTextureUnit)                                                  \
+     X(PFNGLDELETETEXTURESPROC, glDeleteTextures)                                                    \
+diff --git a/runtime/gx.cpp b/runtime/gx.cpp
+index 87866db..cfc9f59 100644
+--- a/runtime/gx.cpp
++++ b/runtime/gx.cpp
+@@ -210,7 +210,12 @@ uint32_t used_maps() {
+ // here when the game's texture has some); the first folder with the name wins. <name> is the
+ // texture's size, format and a hash of its first level's bytes and palette, so it does not
+ // depend on where in memory the game keeps it.
+-struct PackTex { int w, h; std::vector<uint8_t> rgba; };
++struct PackTex {
++    int w, h;
++    std::vector<uint8_t> rgba;                       // RGBA8, or (glfmt) the DDS's compressed levels one after another
++    uint32_t glfmt = 0;                              // 0: RGBA8; else the GL compressed format
++    std::vector<uint32_t> sizes;                     // compressed: each level's bytes
++};
+ 
+ std::string tex_name(uint32_t fmt, int w, int h, const uint8_t* src, uint64_t th) {
+     uint64_t hh = hash_mem(src, gxtex_size(fmt, w, h)) ^ (th * 0x9E3779B97F4A7C15ull);
+@@ -299,10 +304,9 @@ Packs& packs() {
+                     for (auto& ch : ext) ch = (char)std::tolower((unsigned char)ch);
+                     for (auto& ch : stem) ch = (char)std::tolower((unsigned char)ch);
+                     if (ext == ".png") idx.emplace(stem, it->path().string());
+-                    else if (ext == ".dds") ++dds;
++                    else if (ext == ".dds") { ++dds; idx.emplace(stem, it->path().string()); }
+                 }
+-                rt_log("gx: texture pack %s: %zu pictures", one.c_str(), idx.size());
+-                if (dds) rt_log("gx: texture pack %s: %zu DDS files left out (only PNG is read)", one.c_str(), dds);
++                rt_log("gx: texture pack %s: %zu pictures (%zu of them DDS)", one.c_str(), idx.size(), dds);
+                 q.any = q.any || !idx.empty();
+                 q.index.push_back(std::move(idx));
+             }
+@@ -311,22 +315,88 @@ Packs& packs() {
+     return p;
+ }
+ 
++// a DDS of a texture pack: BC1 (DXT1), BC2 (DXT3), BC3 (DXT5) or BC7, with its
++// mipmaps, kept compressed for the GPU; or 32-bit uncompressed, made RGBA8
++std::shared_ptr<PackTex> load_dds(const std::string& path) {
++    std::vector<uint8_t> f;
++    if (FILE* fp = std::fopen(path.c_str(), "rb")) {
++        uint8_t buf[65536];
++        size_t n;
++        while ((n = std::fread(buf, 1, sizeof buf, fp)) > 0) f.insert(f.end(), buf, buf + n);
++        std::fclose(fp);
++    }
++    auto u32 = [&](size_t o) { uint32_t v = 0; if (o + 4 <= f.size()) std::memcpy(&v, &f[o], 4); return v; };
++    if (f.size() < 128 || std::memcmp(f.data(), "DDS ", 4) != 0) return nullptr;
++    int h = (int)u32(12), w = (int)u32(16);
++    uint32_t flags = u32(8), mips = (flags & 0x20000) ? std::max(1u, u32(28)) : 1u;
++    uint32_t pf_flags = u32(80), fourcc = u32(84), bits = u32(88);
++    size_t data = 128;
++    uint32_t glfmt = 0, block = 0;
++    auto cc = [](const char* s) { return (uint32_t)s[0] | (uint32_t)s[1] << 8 | (uint32_t)s[2] << 16 | (uint32_t)s[3] << 24; };
++    if (pf_flags & 4) {                                     // a FourCC
++        if (fourcc == cc("DXT1")) { glfmt = 0x83F1; block = 8; }
++        else if (fourcc == cc("DXT3")) { glfmt = 0x83F2; block = 16; }
++        else if (fourcc == cc("DXT5")) { glfmt = 0x83F3; block = 16; }
++        else if (fourcc == cc("DX10")) {
++            uint32_t dxgi = u32(128);
++            data = 148;
++            if (dxgi == 71 || dxgi == 72) { glfmt = 0x83F1; block = 8; }
++            else if (dxgi == 74 || dxgi == 75) { glfmt = 0x83F2; block = 16; }
++            else if (dxgi == 77 || dxgi == 78) { glfmt = 0x83F3; block = 16; }
++            else if (dxgi == 98 || dxgi == 99) { glfmt = 0x8E8C; block = 16; }      // BC7 (the sRGB one too, as Dolphin)
++            else if (dxgi == 28 || dxgi == 29) { bits = 32; pf_flags = 0x41; }     // RGBA8
++            else if (dxgi == 87 || dxgi == 91) { bits = 32; pf_flags = 0x41 | 0x80000000u; }   // BGRA8
++        }
++    }
++    if (w <= 0 || h <= 0 || w > 8192 || h > 8192) return nullptr;
++    auto t = std::make_shared<PackTex>();
++    t->w = w; t->h = h;
++    if (glfmt) {
++        size_t at = data;
++        for (uint32_t l = 0; l < mips && l < 16; ++l) {
++            size_t lw = std::max(1, w >> l), lh = std::max(1, h >> l);
++            size_t size = ((lw + 3) / 4) * ((lh + 3) / 4) * block;
++            if (at + size > f.size()) break;
++            t->sizes.push_back((uint32_t)size);
++            at += size;
++        }
++        if (t->sizes.empty()) return nullptr;
++        t->glfmt = glfmt;
++        t->rgba.assign(f.begin() + (std::ptrdiff_t)data, f.begin() + (std::ptrdiff_t)(data + (at - data)));
++        return t;
++    }
++    if ((pf_flags & 0x40) && bits == 32 && data + (size_t)w * h * 4 <= f.size()) {   // uncompressed 32-bit
++        bool bgra = (pf_flags & 0x80000000u) || u32(92) == 0x00FF0000u;
++        t->rgba.assign(f.begin() + (std::ptrdiff_t)data, f.begin() + (std::ptrdiff_t)(data + (size_t)w * h * 4));
++        if (bgra) for (size_t i = 0; i < t->rgba.size(); i += 4) std::swap(t->rgba[i], t->rgba[i + 2]);
++        if (!(u32(80) & 1) && !(pf_flags & 1)) for (size_t i = 3; i < t->rgba.size(); i += 4) t->rgba[i] = 255;
++        return t;
++    }
++    return nullptr;
++}
++
+ std::shared_ptr<PackTex> pack_load(const std::string& path, const std::string& label) {
+     static std::list<std::pair<std::string, std::shared_ptr<PackTex>>> lru;     // most recent first
+     static size_t bytes = 0;
+     for (auto it = lru.begin(); it != lru.end(); ++it)
+         if (it->first == path) { lru.splice(lru.begin(), lru, it); return lru.front().second; }
+-    int w = 0, h = 0, n = 0;
+-    unsigned char* px = stbi_load(path.c_str(), &w, &h, &n, 4);
+-    if (!px) { rt_log("gx: %s: not a PNG it can read", path.c_str()); return nullptr; }
+     std::shared_ptr<PackTex> t;
+-    if (w > 0 && h > 0 && w <= 8192 && h <= 8192) {
+-        t = std::make_shared<PackTex>(PackTex{w, h, std::vector<uint8_t>(px, px + (size_t)w * h * 4)});
+-        static int told = 0;
+-        if (told++ < 20) rt_log("gx: %s replaced (%dx%d)", label.c_str(), w, h);
++    std::string ext = path.size() > 4 ? path.substr(path.size() - 4) : "";
++    for (auto& ch : ext) ch = (char)std::tolower((unsigned char)ch);
++    if (ext == ".dds") {
++        t = load_dds(path);
++        if (!t) { rt_log("gx: %s: a DDS it cannot read (BC1, BC2, BC3, BC7 or 32-bit only)", path.c_str()); return nullptr; }
++    } else {
++        int w = 0, h = 0, n = 0;
++        unsigned char* px = stbi_load(path.c_str(), &w, &h, &n, 4);
++        if (!px) { rt_log("gx: %s: not a PNG it can read", path.c_str()); return nullptr; }
++        if (w > 0 && h > 0 && w <= 8192 && h <= 8192)
++            t = std::make_shared<PackTex>(PackTex{w, h, std::vector<uint8_t>(px, px + (size_t)w * h * 4), 0, {}});
++        stbi_image_free(px);
++        if (!t) return nullptr;
+     }
+-    stbi_image_free(px);
+-    if (!t) return nullptr;
++    static int told = 0;
++    if (told++ < 20) rt_log("gx: %s replaced (%dx%d%s)", label.c_str(), t->w, t->h, t->glfmt ? ", compressed" : "");
+     lru.emplace_front(path, t);
+     bytes += t->rgba.size();
+     while (bytes > (512u << 20) && lru.size() > 1) { bytes -= lru.back().second->rgba.size(); lru.pop_back(); }
+@@ -353,6 +423,12 @@ std::shared_ptr<PackTex> pack_lookup(uint32_t fmt, int w, int h, bool mips, cons
+             if (!path.empty()) break;
+         }
+         f = found.emplace(name, path).first;
++        static size_t asked = 0, hits = 0;                     // how much of the pack is found
++        ++asked;
++        if (!path.empty()) ++hits;
++        static const bool verbose = std::getenv("WIIKIT_TEXTURE_PACK_LOG") != nullptr;
++        if (verbose && path.empty()) rt_log("gx: pack: no %s (%s)", d1.c_str(), name.c_str());
++        if (asked % 500 == 0) rt_log("gx: texture packs: %zu of %zu textures found", hits, asked);
+     }
+     if (f->second.empty()) return nullptr;
+     return pack_load(f->second, name);
+@@ -446,7 +522,24 @@ void bind_map(int m) {
+     }
+     std::shared_ptr<PackTex> rep;
+     if (upload && tex_packs) rep = pack_lookup(fmt, w, h, (mode0 >> 5 & 3) != 0, src, pal, tname);
+-    if (rep) {                                         // the pack's picture instead, and its mipmaps
++    if (rep && rep->glfmt) {                           // a DDS: compressed, with its own mipmaps
++        ++st.uploads;
++        int rl = levels > 1 ? (int)rep->sizes.size() : 1;
++        put<uint8_t>(VC_TEXUPC);
++        put<uint8_t>((uint8_t)m);
++        put<uint32_t>(e.id);
++        put<uint16_t>((uint16_t)rep->w);
++        put<uint16_t>((uint16_t)rep->h);
++        put<uint8_t>((uint8_t)rl);
++        put<uint32_t>(rep->glfmt);
++        size_t at = 0;
++        for (int l = 0; l < rl; ++l) {
++            put<uint32_t>(rep->sizes[(size_t)l]);
++            std::memcpy(grow(rep->sizes[(size_t)l]), rep->rgba.data() + at, rep->sizes[(size_t)l]);
++            at += rep->sizes[(size_t)l];
++        }
++        map_bound[m] = e.id;
++    } else if (rep) {                                  // the pack's picture instead, and its mipmaps
+         ++st.uploads;
+         int full = 1;
+         while ((rep->w >> full) || (rep->h >> full)) ++full;
+diff --git a/runtime/video.cpp b/runtime/video.cpp
+index 37343ee..9f2c54a 100644
+--- a/runtime/video.cpp
++++ b/runtime/video.cpp
+@@ -101,7 +101,7 @@ bool ps_valid = false;
+ uint32_t sampler_mode[8][2];
+ bool sampler_set[8];
+ 
+-struct Tex { GLuint name = 0; int w = 0, h = 0, levels = 0; };
++struct Tex { GLuint name = 0; int w = 0, h = 0, levels = 0; GLenum fmt = GL_RGBA8; };
+ std::unordered_map<uint32_t, Tex> texs;            // decoded textures, by id
+ std::unordered_map<uint32_t, Tex> efb_copies;      // EFB copies to texture, by address
+ std::unordered_map<uint32_t, Tex> xfbs;            // EFB copies to the XFB, by address
+@@ -265,12 +265,12 @@ void save_program(GLuint p, uint64_t hash) {
+     }
+ }
+ 
+-void ensure_tex(Tex& t, int w, int h, int levels) {
+-    if (t.name && t.w == w && t.h == h && t.levels == levels) return;
++void ensure_tex(Tex& t, int w, int h, int levels, GLenum fmt = GL_RGBA8) {
++    if (t.name && t.w == w && t.h == h && t.levels == levels && t.fmt == fmt) return;
+     if (t.name) glDeleteTextures(1, &t.name);
+     glCreateTextures(GL_TEXTURE_2D, 1, &t.name);
+-    glTextureStorage2D(t.name, levels, GL_RGBA8, w, h);
+-    t.w = w; t.h = h; t.levels = levels;
++    glTextureStorage2D(t.name, levels, fmt, w, h);
++    t.w = w; t.h = h; t.levels = levels; t.fmt = fmt;
+ }
+ 
+ void APIENTRY gl_debug(GLenum, GLenum type, GLuint, GLenum severity, GLsizei, const GLchar* msg, const void*) {
+@@ -1142,6 +1142,21 @@ void exec(const std::vector<uint8_t>& data) {
+             map_src[m] = id;
+             break;
+         }
++        case VC_TEXUPC: {                                      // a pack's DDS: BC1/BC2/BC3/BC7, as it is
++            uint8_t m = rd<uint8_t>(p);
++            uint32_t id = rd<uint32_t>(p);
++            int w = rd<uint16_t>(p), h = rd<uint16_t>(p), levels = rd<uint8_t>(p);
++            GLenum fmt = rd<uint32_t>(p);
++            Tex* t = nullptr;
++            if (!replaying) { t = &texs[id]; ensure_tex(*t, w, h, levels, fmt); }
++            for (int l = 0; l < levels; ++l) {
++                uint32_t size = rd<uint32_t>(p);
++                if (t) glCompressedTextureSubImage2D(t->name, l, 0, 0, std::max(1, w >> l), std::max(1, h >> l), fmt, (GLsizei)size, p);
++                p += size;
++            }
++            map_src[m] = id;
++            break;
++        }
+         case VC_TEXBIND: { uint8_t m = rd<uint8_t>(p); map_src[m] = rd<uint32_t>(p); break; }
+         case VC_TEXEFB: { uint8_t m = rd<uint8_t>(p); map_src[m] = 1ull << 32 | rd<uint32_t>(p); break; }
+         case VC_FRAME:
+diff --git a/runtime/video.h b/runtime/video.h
+index ecfb499..3366b67 100644
+--- a/runtime/video.h
++++ b/runtime/video.h
+@@ -34,7 +34,8 @@ struct GVtx {
+ };
+ static_assert(sizeof(GVtx) == 132, "GVtx layout");
+ 
+-enum : uint8_t { VC_BP = 1, VC_XF, VC_DRAW, VC_TEXUP, VC_TEXBIND, VC_TEXEFB, VC_FRAME, VC_DRAWDONE };
++enum : uint8_t { VC_BP = 1, VC_XF, VC_DRAW, VC_TEXUP, VC_TEXBIND, VC_TEXEFB, VC_FRAME, VC_DRAWDONE,
++                VC_TEXUPC };                       // a compressed texture of a pack (DDS): its GL format and levels
+ enum : uint8_t { VTX_COL0 = 1, VTX_COL1 = 2, VTX_NRM = 4, VTX_NBT = 8 };
+ 
+ // video.cpp

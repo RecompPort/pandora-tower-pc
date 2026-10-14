@@ -1,0 +1,37 @@
+diff --git a/runtime/wiiboot.cpp b/runtime/wiiboot.cpp
+index d53f4e6..04eea1c 100644
+--- a/runtime/wiiboot.cpp
++++ b/runtime/wiiboot.cpp
+@@ -3,7 +3,7 @@
+ //     wiiboot EXTRACT_DIR [--nand DIR] [--fonts DIR] [--symbols symbols.tsv] [--mmio-log] [--watch SECONDS]
+ //                         [--no-video] [--no-audio] [--scale N] [--frames-ahead N] [--dump DIR]
+ //                         [--dump-every N] [--quit-after SECONDS] [--aspect 16:9|4:3]
+-//                         [--language en|fr|es|de|it|nl|ja] [--fullscreen] [--window WxH] [--keys FILE]
++//                         [--language en|fr|es|de|it|nl|ja|zh|zh-tw|ko] [--fullscreen] [--window WxH] [--keys FILE]
+ //                         [--input auto|pad|keyboard]
+ //
+ // EXTRACT_DIR comes from `python -m wiikit.disc GAME --extract`. The NAND
+@@ -43,7 +43,7 @@ int main(int argc, char** argv) {
+                              "[--mmio-log] [--watch SECONDS]\n"
+                              "                            [--no-video] [--no-audio] [--scale N] [--frames-ahead N] "
+                              "[--dump DIR] [--dump-every N] [--quit-after SECONDS]\n"
+-                             "                            [--aspect 16:9|4:3] [--language en|fr|es|de|it|nl|ja] "
++                             "                            [--aspect 16:9|4:3] [--language en|fr|es|de|it|nl|ja|zh|zh-tw|ko] "
+                              "[--fullscreen] [--window WxH] [--keys FILE]\n"
+                              "                            [--input auto|pad|keyboard]\n");
+         return 2;
+@@ -82,10 +82,11 @@ int main(int argc, char** argv) {
+             else if (a == "4:3") so.aspect = 0;
+             else { std::fprintf(stderr, "wiiboot: --aspect is 16:9 or 4:3\n"); return 2; }
+         } else if (!std::strcmp(argv[i], "--language") && i + 1 < argc) {
+-            static const char* codes[] = {"ja", "en", "de", "fr", "es", "it", "nl"};   // IPL.LNG's order
+-            for (int l = 0; l < 7; ++l)
++            // IPL.LNG's order: 7 is Simplified Chinese, 8 Traditional, 9 Korean
++            static const char* codes[] = {"ja", "en", "de", "fr", "es", "it", "nl", "zh", "zh-tw", "ko"};
++            for (int l = 0; l < 10; ++l)
+                 if (!std::strcmp(argv[i + 1], codes[l])) so.language = l;
+-            if (so.language < 0) { std::fprintf(stderr, "wiiboot: --language is one of en fr es de it nl ja\n"); return 2; }
++            if (so.language < 0) { std::fprintf(stderr, "wiiboot: --language is one of en fr es de it nl ja zh zh-tw ko\n"); return 2; }
+             ++i;
+         } else if (!std::strcmp(argv[i], "--fullscreen")) vo.fullscreen = true;
+         else if (!std::strcmp(argv[i], "--keys") && i + 1 < argc) vo.keys = argv[++i];

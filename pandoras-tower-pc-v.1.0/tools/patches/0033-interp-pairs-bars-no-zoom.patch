@@ -1,0 +1,228 @@
+diff --git a/runtime/video.cpp b/runtime/video.cpp
+index 10e8523..97c3670 100644
+--- a/runtime/video.cpp
++++ b/runtime/video.cpp
+@@ -1050,39 +1050,61 @@ void interp_finish() {                               // fr_cur is a whole frame:
+             const uint32_t* x = &f.xfs[d * kSnap + (size_t)pm * 4];
+             out[0] = as_f(x[3]); out[1] = as_f(x[7]); out[2] = as_f(x[11]);
+         };
+-        std::unordered_map<uint64_t, std::vector<int>> by_key;
+-        for (int i = 0; i < (int)a.draws.size(); ++i) by_key[a.draws[i].key].push_back(i);
++        // The same draw with the very same vertices first (a static model, a plant
++        // of a garden: each of its copies keeps its own vertices from frame to
++        // frame), the nearest among all of them; looking at only the first few of
++        // many copies paired a flower with its neighbour, and the frames between
++        // showed it halfway, jumping. With no identical one, the nearest of the
++        // same key; but among many copies whose vertices all changed (particles,
++        // grass moved on the CPU) there is no telling which is which: drawn as
++        // they are, not blended with a stranger.
++        std::unordered_map<uint64_t, std::vector<int>> by_key, by_kv;
++        for (int i = 0; i < (int)a.draws.size(); ++i) {
++            by_key[a.draws[i].key].push_back(i);
++            by_kv[mix64(a.draws[i].key, a.draws[i].verts)].push_back(i);
++        }
++        std::vector<char> used(a.draws.size(), 0);
++        auto nearest = [&](const std::vector<int>& cand, const float tb[3], size_t limit, float& best_d) {
++            int best = -1;
++            best_d = 1e30f;
++            size_t seen = 0;
++            for (int c : cand) {
++                if (used[(size_t)c]) continue;
++                if (++seen > limit) break;
++                float ta[3];
++                trans(a, (size_t)c, ta);
++                float d = (ta[0] - tb[0]) * (ta[0] - tb[0]) + (ta[1] - tb[1]) * (ta[1] - tb[1]) + (ta[2] - tb[2]) * (ta[2] - tb[2]);
++                if (d < best_d) { best_d = d; best = c; }
++            }
++            return best;
++        };
+         size_t paired = 0;
+         for (size_t k = 0; k < b.draws.size(); ++k) {
+-            auto it = by_key.find(b.draws[k].key);
+-            if (it == by_key.end() || it->second.empty()) continue;
+-            std::vector<int>& cand = it->second;
+             float tb[3];
+             trans(b, k, tb);
+-            // the very same vertices first: a model skinned by its matrices keeps
+-            // them from frame to frame, and the pieces of one model (a cape, a
+-            // chain of bones) may share the same key and lie close together: a
+-            // piece paired with its neighbour would be blended towards it and
+-            // drawn stretched. Among those (or, if none, all), the nearest.
+-            bool any_same = false;
+-            for (size_t c = 0; c < cand.size() && c < 16; ++c)
+-                if (a.draws[(size_t)cand[c]].verts == b.draws[k].verts) { any_same = true; break; }
+-            size_t best = 0;
+             float best_d = 1e30f;
+-            for (size_t c = 0; c < cand.size() && c < 16; ++c) {
+-                if (any_same && a.draws[(size_t)cand[c]].verts != b.draws[k].verts) continue;
+-                float ta[3];
+-                trans(a, (size_t)cand[c], ta);
+-                float d = (ta[0] - tb[0]) * (ta[0] - tb[0]) + (ta[1] - tb[1]) * (ta[1] - tb[1]) + (ta[2] - tb[2]) * (ta[2] - tb[2]);
+-                if (d < best_d) { best_d = d; best = c; }
++            int best = -1;
++            bool same = false;
++            if (auto e = by_kv.find(mix64(b.draws[k].key, b.draws[k].verts)); e != by_kv.end()) {
++                best = nearest(e->second, tb, (size_t)-1, best_d);
++                same = best >= 0;
++            }
++            if (best < 0) {
++                auto it = by_key.find(b.draws[k].key);
++                if (it == by_key.end()) continue;
++                size_t left = 0;
++                for (int c : it->second) if (!used[(size_t)c] && ++left > 4) break;
++                if (left > 4) continue;                           // many changed copies: no pair
++                best = nearest(it->second, tb, 16, best_d);
++                if (best < 0) continue;
+             }
+             float ta[3];
+-            trans(a, (size_t)cand[best], ta);
++            trans(a, (size_t)best, ta);
+             float ra = ta[0] * ta[0] + ta[1] * ta[1] + ta[2] * ta[2], rb = tb[0] * tb[0] + tb[1] * tb[1] + tb[2] * tb[2];
+             bool sane = std::isfinite(best_d) && (best_d <= 0.25f || best_d <= std::max(ra, rb) / 9.0f);
+-            if (sane) b.pair[k] = cand[best];
+-            cand.erase(cand.begin() + (std::ptrdiff_t)best);
+-            if (sane) ++paired;
++            used[(size_t)best] = 1;
++            if (sane) { b.pair[k] = best; ++paired; }
++            (void)same;
+         }
+         b.cut = paired * 2 < b.draws.size();
+     }
+@@ -2200,6 +2222,27 @@ void find_letterbox(const Tex& t) {
+     // too dark to tell), so the play's edges are not left cut
+     static bool releasing = false;
+     static int release_frames = 0;
++    static std::vector<uint8_t> rel_ref;                              // the picture the crop was measured on
++    // a picture dark enough that a change of its crop can't be seen (a fade)
++    auto dark = [](const std::vector<uint8_t>& px) {
++        size_t lit = 0, n = px.size() / 4;
++        for (size_t i = 0; i < px.size(); i += 4) lit += std::max({px[i], px[i + 1], px[i + 2]}) > 40;
++        return lit * 200 < n;                                         // under 0.5 % lit
++    };
++    // another scene (a cut), not the same picture going on or fading: the two
++    // pictures' brightness, point by point, hardly related
++    auto cut = [](const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
++        if (a.size() != b.size() || a.empty()) return true;
++        double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
++        size_t n = a.size() / 4;
++        for (size_t i = 0; i < a.size(); i += 4) {
++            double x = a[i] + 2.0 * a[i + 1] + a[i + 2], y = b[i] + 2.0 * b[i + 1] + b[i + 2];
++            sa += x; sb += y; saa += x * x; sbb += y * y; sab += x * y;
++        }
++        double ma = sa / n, mb = sb / n, va = saa / n - ma * ma, vb = sbb / n - mb * mb;
++        if (va < 400 || vb < 400) return std::fabs(ma - mb) > 120;   // a flat picture: by its brightness
++        return (sab / n - ma * mb) / std::sqrt(va * vb) < 0.5;
++    };
+     auto release_now = [&]() {
+         releasing = false;
+         release_frames = 0;
+@@ -2213,22 +2256,31 @@ void find_letterbox(const Tex& t) {
+         if (letterbox.load() > 0.0f || pillarbox.load() > 0.0f) { releasing = true; release_frames = 0; }
+         else target_v = target_h = 0.0f;
+     }
++    if (hint == 3) {                                                  // a loading screen ends: its crop goes on a
++        movie_hint.store(0);                                          // black picture or at the next scene
++        hint = 0;
++        loading_locked = false;
++        seen_v = seen_h = -1; agree = 0;
++        if (letterbox.load() > 0.0f || pillarbox.load() > 0.0f) { releasing = true; release_frames = 0; }
++        else target_v = target_h = 0.0f;
++    }
+     if (releasing && (hint == 1 || hint == 2)) releasing = false;    // a new movie or loading screen: it decides
+     if (releasing) {
+         std::vector<uint8_t> px((size_t)kLines * (t.h + t.w) * 4);
+         read(px.data());                                              // this picture, before it is shown
+-        bool all_dark = true;
+-        for (size_t i = 0; i < px.size() && all_dark; i += 4)
+-            if (std::max({px[i], px[i + 1], px[i + 2]}) > 24) all_dark = false;
++        bool all_dark = dark(px);
++        if (rel_ref.empty() || rel_ref.size() != px.size()) rel_ref = px;   // none measured: this one
+         char why_v[96], why_h[96];
+         int v = bar_size_edges(px.data(), t.h, kLines, why_v, sizeof why_v);
+         int hz = bar_size_edges(px.data() + (size_t)kLines * t.h * 4, t.w, kLines, why_h, sizeof why_h);
+-        if (all_dark || (v == 0 && hz == 0) || ++release_frames > 150) {
++        // never while the same picture is on: no bars shown, and no zoom of it seen
++        bool scene = v == 0 && hz == 0 && cut(rel_ref, px);
++        if (all_dark || scene || ++release_frames > 300) {
+             static int n = 0;
+-            if (n++ < 12) rt_log("video: black bars gone: crop off (%s)", all_dark ? "on a black picture" : v == 0 && hz == 0 ? "the picture has none" : "five seconds");
++            if (n++ < 12) rt_log("video: black bars gone: crop off (%s)", all_dark ? "on a black picture" : scene ? "another scene" : "ten seconds");
+             release_now();
++            rel_ref.clear();
+         }
+-        if (hint == 3) movie_hint.store(0);
+         return;                                                       // until then, the crop as it was
+     }
+     // bars within 1.5 % of those of the loading screens before are theirs: every
+@@ -2252,25 +2304,33 @@ void find_letterbox(const Tex& t) {
+     int kind = hint == 2 || hint == 3 ? 1 : 0;
+     static int fresh_tries = 0;
+     if ((hint == 1 || hint == 2) && movie_fresh.load() && ++fresh_tries > 180) {   // three seconds without a measurable picture:
+-        movie_fresh.store(false);                                     // the readings as it goes decide,
+-        fresh_tries = 0;                                              // from the bars of the ones before
+-        if (movie_bars(kind).v >= 0) { target_v = movie_bars(kind).v; target_h = movie_bars(kind).h; }
++        movie_fresh.store(false);                                     // the readings as it goes decide
++        fresh_tries = 0;                                              // (no crop put on a picture showing: a zoom)
+     }
+     if ((hint == 1 || hint == 2) && movie_fresh.load()) {
+         if (fresh_tries == 1 && hint == 2) loading_locked = false;     // a new loading screen
+         // a movie has just begun: read this very picture (waiting for it), and
+-        // cut its bars before it is shown; until it can be measured (a fade
+-        // in), the bars of the movies before are cut
+-        if (fresh_tries == 1 && movie_bars(kind).v >= 0) {
++        // cut its bars before it is shown. A picture still dark (a fade in) gets
++        // the bars of the ones before now, unseen; one that shows something but
++        // no bars yet (a loading screen not on yet: the play still showing) gets
++        // nothing: a crop put on it would be a zoom
++        std::vector<uint8_t> px((size_t)kLines * (t.h + t.w) * 4);
++        read(px.data());
++        bool is_dark = dark(px);
++        if (is_dark && movie_bars(kind).v >= 0) {
+             letterbox.store(movie_bars(kind).v);
+             pillarbox.store(movie_bars(kind).h);
+         }
+-        std::vector<uint8_t> px((size_t)kLines * (t.h + t.w) * 4);
+-        read(px.data());
+         char why_v[96], why_h[96];
+         int v = bar_size_edges(px.data(), t.h, kLines, why_v, sizeof why_v);
+         int hz = bar_size_edges(px.data() + (size_t)kLines * t.h * 4, t.w, kLines, why_h, sizeof why_h);
++        if (v < 0 || hz < 0) {                                        // a dark picture with plain black bars
++            int sv = bar_size(px.data(), t.h, kLines), sh = bar_size(px.data() + (size_t)kLines * t.h * 4, t.w, kLines);
++            if (sv > 0) { v = sv; hz = std::max(0, sh); }
++        }
++        if (hint == 2 && v == 0 && hz == 0 && !is_dark) return;      // the loading screen is not on yet
+         if (v >= 0 && hz >= 0) {
++            if (v > 0 || hz > 0) rel_ref = px;                        // what the crop belongs to
+             static int n = 0;
+             if (n++ < 20) rt_log("video: movie measured: rows (%s) -> %d, columns (%s) -> %d", why_v, v, why_h, hz);
+             // bars found: kept to the movie's end; none found: the movie is
+@@ -2302,11 +2362,14 @@ void find_letterbox(const Tex& t) {
+         if (st == GL_ALREADY_SIGNALED || st == GL_CONDITION_SATISFIED) {
+             glDeleteSync(fence);
+             fence = nullptr;
+-            const uint8_t* px = (const uint8_t*)glMapNamedBufferRange(pbo, 0, (GLsizeiptr)kLines * (H + W) * 4, GL_MAP_READ_BIT);
++            const uint8_t* mapped = (const uint8_t*)glMapNamedBufferRange(pbo, 0, (GLsizeiptr)kLines * (H + W) * 4, GL_MAP_READ_BIT);
++            static std::vector<uint8_t> seen_px;                      // a copy: the buffer is unmapped at once
++            if (mapped) seen_px.assign(mapped, mapped + (size_t)kLines * (H + W) * 4);
++            const uint8_t* px = mapped ? seen_px.data() : nullptr;
++            if (mapped) glUnmapNamedBuffer(pbo);
+             if (px) {
+                 int v, hz;
+                 measure(px, W, H, v, hz);
+-                glUnmapNamedBuffer(pbo);
+                 if (v >= 0 && hz >= 0) {                              // not a fade to black
+                     if (seen_v >= 0 && seen_h >= 0 && std::abs(v - seen_v) <= H / 200 && std::abs(hz - seen_h) <= W / 200) ++agree;
+                     else { seen_v = v; seen_h = hz; agree = 1; }
+@@ -2318,7 +2381,11 @@ void find_letterbox(const Tex& t) {
+                         // loading screens before stay, as at its start)
+                         bool keep = hint >= 2 && (loading_locked || (seen_v == 0 && seen_h == 0));
+                         if (!keep) {
+-                            if (hint >= 2) { snap(kind, nv, nh, nv, nh); loading_locked = true; }
++                            if (hint >= 2) {
++                                snap(kind, nv, nh, nv, nh);
++                                loading_locked = true;
++                                if (nv > 0 || nh > 0) rel_ref.assign(px, px + (size_t)kLines * (H + W) * 4);
++                            }
+                             bool changed = std::fabs(nv - target_v) > 0.004f || std::fabs(nh - target_h) > 0.004f;
+                             target_v = nv; target_h = nh;
+                             if (changed) report(hint == 1 ? "movie" : hint >= 2 ? "loading screen" : "picture");

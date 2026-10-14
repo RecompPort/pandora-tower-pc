@@ -1,0 +1,46 @@
+diff --git a/runtime/video.cpp b/runtime/video.cpp
+index 924c101..9459b3a 100644
+--- a/runtime/video.cpp
++++ b/runtime/video.cpp
+@@ -1857,10 +1857,17 @@ int bar_size_edges(const uint8_t* px, int len, int lines, char* why, size_t whyl
+     };
+     auto run_lo = [&](int l) { int i = 0; while (i < len && dark(l, i)) ++i; return i; };
+     auto run_hi = [&](int l) { int i = 0; while (i < len && dark(l, len - 1 - i)) ++i; return i; };
+-    int a_lo = run_lo(0), b_lo = run_lo(lines - 1), a_hi = run_hi(0), b_hi = run_hi(lines - 1);
+-    int mid_lo = run_lo(lines / 2);
+-    std::snprintf(why, whylen, "edges %d/%d and %d/%d of %d, middle %d", a_lo, a_hi, b_lo, b_hi, len, mid_lo);
+-    if (mid_lo >= len) return -1;                                     // all black: a fade
++    auto lit = [&](int l) { int n = 0; for (int i = 0; i < len; ++i) n += !dark(l, i); return n; };
++    // the outermost lines, unless they lie in the other bars (a 4:3 movie's
++    // sides are black from top to bottom): then the next ones in
++    int o0 = 0, o1 = lines - 1;
++    if (run_lo(o0) >= len || run_lo(o1) >= len) { o0 = 1; o1 = lines - 2; }
++    int a_lo = run_lo(o0), b_lo = run_lo(o1), a_hi = run_hi(o0), b_hi = run_hi(o1);
++    int mid_lit = lit(lines / 2);
++    std::snprintf(why, whylen, "lines %d/%d and %d/%d of %d (at %s), middle %d%% lit", a_lo, a_hi, b_lo, b_hi, len,
++                  o0 ? "25%/75%" : "5%/95%", mid_lit * 100 / std::max(1, len));
++    // too little to see yet (a fade in, a title on black): not measured, wait
++    if (mid_lit < len * 30 / 100 || a_lo >= len || b_lo >= len) return -1;
+     int lo = std::min(a_lo, b_lo), hi = std::min(a_hi, b_hi);
+     int bar = std::min(lo, hi);
+     bool bars = bar >= len * 4 / 100 && bar <= len * 35 / 100 && std::abs(lo - hi) <= len * 3 / 100;
+@@ -1916,6 +1923,11 @@ void find_letterbox(const Tex& t) {
+         pillarbox.store(0.0f);
+         return;
+     }
++    static int fresh_tries = 0;
++    if (hint == 1 && movie_fresh.load() && ++fresh_tries > 180) {    // three seconds without a measurable picture:
++        movie_fresh.store(false);                                     // the readings as the movie goes decide
++        fresh_tries = 0;
++    }
+     if (hint == 1 && movie_fresh.load()) {
+         // a movie has just begun: read this very picture (waiting for it), and
+         // cut its bars before it is shown; while it is all black, nothing shows
+@@ -1928,6 +1940,7 @@ void find_letterbox(const Tex& t) {
+             static int n = 0;
+             if (n++ < 20) rt_log("video: movie measured: rows (%s) -> %d, columns (%s) -> %d", why_v, v, why_h, hz);
+             movie_locked = true;
++            fresh_tries = 0;
+             target_v = (float)v / (float)t.h;
+             target_h = (float)hz / (float)t.w;
+             seen_v = v; seen_h = hz; agree = 3;

@@ -1,0 +1,73 @@
+diff --git a/runtime/video.cpp b/runtime/video.cpp
+index b8220ce..280a9d3 100644
+--- a/runtime/video.cpp
++++ b/runtime/video.cpp
+@@ -843,6 +843,7 @@ struct IFrame {
+     int32_t reg0[4][4], konst0[4][4];
+ };
+ bool interp_on = false, replaying = false, frame_ended = false;
++int interp_rate = 0;                               // 0: paced by the refresh; -1: unlimited; N: a timer at N fps
+ std::unique_ptr<IFrame> fr_prev, fr_last, fr_cur;
+ uint64_t frame_ids = 0;
+ IFrame* rp_a = nullptr;
+@@ -2003,8 +2004,31 @@ void video_run(const char* title) {
+     if (const char* d = std::getenv("WIIKIT_INTERP"); d && d[0] == '1') {
+         interp_on = true;
+         fr_cur = new_frame();
+-        if (!SDL_GL_SetSwapInterval(-1)) SDL_GL_SetSwapInterval(1);       // the screen's own rate (adaptive if it can)
+-        rt_log("video: frame interpolation on (the screen's refresh rate; one game frame behind)");
++        // WIIKIT_INTERP_FPS: unset or 0, the screen's own rate (its refresh, waited
++        // for); max, as fast as it goes (no waiting); N, N frames a second: by
++        // waiting for every k-th refresh when the screen's rate is k times N, else
++        // by a timer, without waiting for the refresh
++        const char* r = std::getenv("WIIKIT_INTERP_FPS");
++        const SDL_DisplayMode* dm = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(win));
++        double hz = dm && dm->refresh_rate > 0 ? dm->refresh_rate : 60.0;
++        if (r && SDL_strcasecmp(r, "max") == 0) {
++            interp_rate = -1;
++            SDL_GL_SetSwapInterval(0);
++            rt_log("video: frame interpolation on, as fast as it goes (one game frame behind)");
++        } else if (r && std::atoi(r) > 0) {
++            interp_rate = std::atoi(r);
++            double k = hz / interp_rate;
++            if (std::fabs(k - std::round(k)) < 0.02 && std::round(k) >= 1 && SDL_GL_SetSwapInterval((int)std::round(k))) {
++                rt_log("video: frame interpolation on, %d fps (every %d refresh of %.0f Hz)", interp_rate, (int)std::round(k), hz);
++                interp_rate = 0;                                    // the refresh paces it
++            } else {
++                SDL_GL_SetSwapInterval(0);
++                rt_log("video: frame interpolation on, %d fps (timed; the screen runs at %.0f Hz)", interp_rate, hz);
++            }
++        } else {
++            if (!SDL_GL_SetSwapInterval(-1)) SDL_GL_SetSwapInterval(1);   // the screen's own rate (adaptive if it can)
++            rt_log("video: frame interpolation on, the screen's rate (%.0f Hz; one game frame behind)", hz);
++        }
+     }
+     if (const char* d = std::getenv("WIIKIT_INTERP_DIAG"); d && d[0] == '1') {
+         interp_diag = true;
+@@ -2150,11 +2174,22 @@ void video_run(const char* title) {
+                     t = (float)std::min(1.0, std::chrono::duration<double>(Clock::now() - fr_last->when).count() / dt);
+                 }
+                 auto tp = Clock::now();
+-                if (t < 1.0f || shown != fr_last->id) interp_replay(t);
++                bool fresh = t < 1.0f || shown != fr_last->id;
++                if (fresh) interp_replay(t);
+                 shown = t < 1.0f ? 0 : fr_last->id;
+-                present();
+-                if (g_vperf_on) g_vperf.present += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - tp).count();
+-                busy = true;
++                if (fresh || interp_rate == 0) {                    // the refresh waits; else only new pictures
++                    present();
++                    if (g_vperf_on) g_vperf.present += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - tp).count();
++                    busy = true;
++                }
++                if (interp_rate > 0) {                              // the timer: one picture each 1/N s
++                    static Clock::time_point next = Clock::now();
++                    auto period = std::chrono::nanoseconds(1000000000LL / interp_rate);
++                    auto now = Clock::now();
++                    next += period;
++                    if (next < now - period) next = now + period;
++                    if (next > now) SDL_DelayPrecise((Uint64)std::chrono::duration_cast<std::chrono::nanoseconds>(next - now).count());
++                }
+             }
+             if (!busy) SDL_WaitSemaphoreTimeout(wake, 2);
+             continue;

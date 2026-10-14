@@ -1,0 +1,210 @@
+diff --git a/runtime/gx.cpp b/runtime/gx.cpp
+index daddf01..5f315b0 100644
+--- a/runtime/gx.cpp
++++ b/runtime/gx.cpp
+@@ -181,7 +181,8 @@ struct TexKeyHash {
+         return (size_t)(k.addr * 0x9E3779B1u ^ k.shape * 0x85EBCA77u ^ k.levels ^ k.tlut);
+     }
+ };
+-struct TexEntry { uint32_t id; uint64_t hash; uint32_t gen; };
++struct TexEntry { uint32_t id; uint64_t hash; uint32_t gen; uint64_t used = 0; };
++std::unordered_map<uint32_t, std::string> pack_waiting;       // texture -> its pack's picture, not read yet
+ std::unordered_map<TexKey, TexEntry, TexKeyHash> tcache;
+ uint32_t tex_next_id = 1, tex_gen = 1;
+ uint8_t tex_dirty = 0xFF;                          // maps whose binding must be looked at again
+@@ -619,6 +620,7 @@ void bind_map(int m) {
+     auto [it, fresh] = tcache.try_emplace(key, TexEntry{tex_next_id, 0, 0});
+     if (fresh) ++tex_next_id;
+     TexEntry& e = it->second;
++    e.used = st.frames;
+     bool upload = false;
+     if (fresh || e.gen != tex_gen) {
+         uint64_t hh = hash_mem(src, total);
+@@ -642,7 +644,7 @@ void bind_map(int m) {
+     }
+     std::shared_ptr<PackTex> rep;
+     if (tex_packs) {
+-        static std::unordered_map<uint32_t, std::string> waiting;     // texture -> its picture, being read
++        auto& waiting = pack_waiting;                                 // texture -> its picture, being read
+         if (upload) {
+             waiting.erase(e.id);
+             std::string path = pack_find(fmt, w, h, (mode0 >> 5 & 3) != 0, src, pal, tname);
+@@ -885,6 +887,30 @@ uint8_t decode_vertices(const VtxFmt& f, const uint8_t* p, uint32_t count, GVtx*
+ void efb_copy(uint32_t v) {
+     if (v >> 14 & 1) {                                 // to the XFB: the frame is done
+         ++st.frames;
++        // each frame, the textures' bytes are looked at again when they are next
++        // bound (not only after GXInvalidateTexAll): a texture loaded where another
++        // of the same shape was, with no invalidation (an area left and come back
++        // to), shows its own picture, not the one from before
++        ++tex_gen;
++        tex_dirty = 0xFF;
++        // textures not used for 30 seconds (the places left behind): forgotten here
++        // and freed on the GPU, a pack's large pictures included; used again, they
++        // are uploaded again
++        if (st.frames % 300 == 0) {
++            size_t freed = 0;
++            for (auto t = tcache.begin(); t != tcache.end();) {
++                if (st.frames - t->second.used > 900) {
++                    uint32_t id = t->second.id;
++                    for (int m = 0; m < 8; ++m) if (map_bound[m] == id) map_bound[m] = 0;
++                    pack_waiting.erase(id);
++                    if (video) { put<uint8_t>(VC_TEXFREE); put<uint32_t>(id); }
++                    t = tcache.erase(t);
++                    ++freed;
++                } else ++t;
++            }
++            static int told = 0;
++            if (freed && told < 5) { ++told; rt_log("gx: %zu textures not used for 30 s freed", freed); }
++        }
+         if (video) {
+             put<uint8_t>(VC_FRAME);
+             ++rec_frames;
+diff --git a/runtime/video.cpp b/runtime/video.cpp
+index 5bddd34..10e8523 100644
+--- a/runtime/video.cpp
++++ b/runtime/video.cpp
+@@ -556,7 +556,10 @@ GLuint program_for(uint8_t vflags) {
+     if (it != programs.end()) return it->second;
+     if (auto pk = pending_key.find(key); pk != pending_key.end()) {
+         GLuint p = 0;
+-        if (!poll_pending(pk->second, p)) return 0;          // still linking: skip the draw
++        if (!poll_pending(pk->second, p)) {
++            if (async_shaders) return 0;                         // still linking: skip the draw
++            p = wait_pending(pk->second);                        // waiting for shaders: wait for it
++        }
+         pending_key.erase(pk);
+         programs.emplace(std::move(key), p);
+         return p;
+@@ -1206,6 +1209,80 @@ void copy_readback(uint32_t addr) {
+     rb_cv.notify_all();
+ }
+ 
++// Before a piece of a frame is drawn: every new program its draws will need is
++// started now, all of them at once in the driver's threads (the shader cache's
++// ones loaded). Waiting for shaders then waits for the slowest of them, not for
++// each in turn: a place with many new effects pauses once, briefly, instead of
++// stopping again and again
++int prelink(const uint32_t* b, const uint32_t* x, uint8_t vflags) {
++    std::string key = gx_shader_key(b, x, vflags);
++    if (programs.count(key) || pending_key.count(key)) return 0;
++    std::string vs, fs;
++    gx_shader_gen(b, x, vflags, vs, fs);
++    std::string source = vs + '\0' + fs;
++    if (auto same = programs_by_source.find(source); same != programs_by_source.end()) {
++        programs.emplace(std::move(key), same->second);
++        return 0;
++    }
++    remember(source);
++    if (pending_by_source.count(source)) { pending_key.emplace(std::move(key), std::move(source)); return 0; }
++    uint64_t hash = source_hash(source);
++    if (GLuint p = load_program(hash)) {
++        ++cnt.cached;
++        programs_by_source.emplace(source, p);
++        programs.emplace(std::move(key), p);
++        return 0;
++    }
++    pending_by_source.emplace(source, PendingProgram{link_async(vs, fs), hash});
++    pending_key.emplace(std::move(key), std::move(source));
++    ++cnt.programs;
++    return 1;
++}
++
++void prescan(const std::vector<uint8_t>& data) {
++    if (!parallel_links) return;
++    static uint32_t pbp[0x100], pxf[0x1058];
++    std::memcpy(pbp, bp, sizeof pbp);
++    std::memcpy(pxf, xf, sizeof pxf);
++    const uint8_t* p = data.data();
++    const uint8_t* end = p + data.size();
++    while (p < end) {
++        switch (*p++) {
++        case VC_BP: { uint32_t v = rd<uint32_t>(p); pbp[v >> 24] = v & 0xFFFFFF; break; }
++        case VC_XF: {
++            uint16_t a = rd<uint16_t>(p), n = rd<uint16_t>(p);
++            std::memcpy(&pxf[a], p, 4u * n);
++            p += 4u * n;
++            break;
++        }
++        case VC_DRAW: {
++            uint8_t prim = rd<uint8_t>(p), fl = rd<uint8_t>(p);
++            uint32_t pieces = rd<uint32_t>(p);
++            for (uint32_t i = 0; i < pieces; ++i) { uint32_t n = rd<uint32_t>(p); p += (size_t)n * sizeof(GVtx); }
++            if (!(prim < 0xA8 && (pbp[0x00] >> 14 & 3) == 3)) prelink(pbp, pxf, fl);
++            break;
++        }
++        case VC_TEXUP: {
++            p += 1 + 4;
++            int w = rd<uint16_t>(p), h = rd<uint16_t>(p), levels = rd<uint8_t>(p);
++            for (int l = 0; l < levels; ++l) p += (size_t)std::max(1, w >> l) * std::max(1, h >> l) * 4;
++            break;
++        }
++        case VC_TEXUPC: {
++            p += 1 + 4 + 2 + 2;
++            int levels = rd<uint8_t>(p);
++            p += 4;
++            for (int l = 0; l < levels; ++l) { uint32_t size = rd<uint32_t>(p); p += size; }
++            break;
++        }
++        case VC_TEXBIND: case VC_TEXEFB: p += 1 + 4; break;
++        case VC_TEXFREE: p += 4; break;
++        case VC_FRAME: case VC_DRAWDONE: break;
++        default: return;                                           // exec says what is wrong
++        }
++    }
++}
++
+ void exec(const std::vector<uint8_t>& data) {
+     const uint8_t* p = data.data();
+     const uint8_t* end = p + data.size();
+@@ -1273,6 +1350,15 @@ void exec(const std::vector<uint8_t>& data) {
+             break;
+         }
+         case VC_TEXBIND: { uint8_t m = rd<uint8_t>(p); map_src[m] = rd<uint32_t>(p); break; }
++        case VC_TEXFREE: {                                     // not used for a while: its memory back
++            uint32_t id = rd<uint32_t>(p);
++            if (replaying) break;
++            if (auto it = texs.find(id); it != texs.end()) {
++                if (it->second.name) glDeleteTextures(1, &it->second.name);
++                texs.erase(it);
++            }
++            break;
++        }
+         case VC_TEXEFB: { uint8_t m = rd<uint8_t>(p); map_src[m] = 1ull << 32 | rd<uint32_t>(p); break; }
+         case VC_FRAME:
+             if (replaying) break;
+@@ -2222,10 +2308,10 @@ void find_letterbox(const Tex& t) {
+                 measure(px, W, H, v, hz);
+                 glUnmapNamedBuffer(pbo);
+                 if (v >= 0 && hz >= 0) {                              // not a fade to black
+-                    if (std::abs(v - seen_v) <= H / 200 && std::abs(hz - seen_h) <= W / 200) ++agree;
++                    if (seen_v >= 0 && seen_h >= 0 && std::abs(v - seen_v) <= H / 200 && std::abs(hz - seen_h) <= W / 200) ++agree;
+                     else { seen_v = v; seen_h = hz; agree = 1; }
+                     if (agree >= 3) {
+-                        float nv = (float)seen_v / (float)H, nh = (float)seen_h / (float)W;
++                        float nv = std::max(0.0f, (float)seen_v / (float)H), nh = std::max(0.0f, (float)seen_h / (float)W);
+                         // a loading screen: its bars, once seen, stay to its end (the
+                         // readings go on only to tell when they are gone, below); before
+                         // they are seen, "no bars" changes nothing (the bars of the
+@@ -2699,6 +2785,7 @@ void video_run(const char* title) {
+             }
+             if (c.readback) { if (c.copy) copy_readback(c.copy); else efb_readback(); busy = true; continue; }
+             auto te = Clock::now();
++            prescan(c.data);
+             exec(c.data);
+             if (g_vperf_on) g_vperf.draw += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - te).count();
+             if (interp_on) {                                    // the buffer stays with its frame
+diff --git a/runtime/video.h b/runtime/video.h
+index ddf5229..e7b3721 100644
+--- a/runtime/video.h
++++ b/runtime/video.h
+@@ -35,7 +35,8 @@ struct GVtx {
+ static_assert(sizeof(GVtx) == 132, "GVtx layout");
+ 
+ enum : uint8_t { VC_BP = 1, VC_XF, VC_DRAW, VC_TEXUP, VC_TEXBIND, VC_TEXEFB, VC_FRAME, VC_DRAWDONE,
+-                VC_TEXUPC };                       // a compressed texture of a pack (DDS): its GL format and levels
++                VC_TEXUPC,                         // a compressed texture of a pack (DDS): its GL format and levels
++                VC_TEXFREE };                      // a texture the game has not used for a while: freed
+ enum : uint8_t { VTX_COL0 = 1, VTX_COL1 = 2, VTX_NRM = 4, VTX_NBT = 8 };
+ 
+ // video.cpp

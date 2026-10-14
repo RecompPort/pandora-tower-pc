@@ -1,0 +1,83 @@
+addr	name	evidence
+80545210	OSLoadContext	saves nothing, loads r0-r2/lmw/GQRs/CR/LR/CTR/XER from the context, sets SRR0/SRR1, rfi at 805452E4; sits right after OSSaveContext (80545190, signature)
+8054C880	OSCreateThread	prio range 0..31 check (returns 0 outside), state=1, suspend=1, stack aligned to 8, OSInitContext(80545390), context.lr=OSExitThread(8054CAF0), r3=param, stack magic 0xDEADBABE at stackEnd
+8054A4E0	RealMode	clrlwi r3,r3,2; mtsrr0 r3; mfmsr; clears IR/DR (rlwinm 28..25); mtsrr1; rfi: the SDK RealMode, exact pattern, rfi at 8054A4F4
+80541F60	PPCHalt	sync; nop; li r3,0; nop; b back to the first nop: the SDK spin loop, the only sync+nop+backward-branch shape in the DOL
+805A3DE0	WPADSetSamplingCallback	references both KPAD warning strings (Please call KPADSetSamplingCallback instead...); swaps cb+0x8EC under OSDisableInterrupts, returns the old one
+805A3E70	WPADSetConnectCallback	references the KPAD warning string for the connect callback; KPADInitEx installs 805EA240 through it and keeps the returned old callback
+805A3F00	WPADSetExtensionCallback	same shape as the two setters above (swap cb+0x8E4), placed right after them, and called with WPADSetConnectCallback by both callback save/restore sites (805EFC80, 805EFD30)
+805A9840	WPADSetCallbackByKPAD	stw r3,-0x4dc8(r13); blr: the flag read by the two callback setters to print the KPAD warning
+805A9830	WPADIsUsedCallbackByKPAD	lwz r3,-0x4dc8(r13); blr: reads that same flag
+805E9DC0	KPADInit	li r3,0; li r4,0; b 805E9DD0: KPADInit() = KPADInitEx(NULL, 0)
+805E9DD0	KPADInitEx	installs a connect callback with WPADSetConnectCallback, stores the old one at +0x63C of the 0x688-byte channel block at 807E0D38, and enables the KPAD flag
+805E95A0	KPADRead	li r6,0; li r7,0; b 805E95B0: KPADRead is KPADReadEx without the error out
+805E95B0	KPADReadEx	0x810 bytes, 0x688-byte channel stride, calls WPADProbe, the body KPADRead jumps into
+805EA440	KPADSetConnectCallback	swaps the +0x63C field of the channel block under interrupts; that field is what KPAD's own connect callback (805EA240) forwards to
+80547A60	OSFatal	called by __DVDShowFatalMessage (80558390) as (&fg, &bg, msg): two GXColor structs and the localised DVD error text (An error has occurred. Press the Eject Button...) picked by SCGetLanguage
+8055AFE0	__VIRetraceHandler	VIInit (8055BBB0, the function that registers __VIVersion) installs it with __OSSetInterruptHandler(0x18 = PI VI interrupt, 8055AFE0) at 8055C004; it reads VI DI0 at CC002030
+805A2710	WPADInit	the only WPAD init KPADInitEx calls: registers a shutdown function once, initialises WUD (805B46A0) and on success runs the core init 805A2460 that registers __WPADVersion; hooked as nop the Bluetooth stack never starts
+805A27B0	WPADRegisterAllocator	b WUDRegisterAllocator (805B47B0, signature); called by the game input setup 804F71A8 before KPADInit
+805A27C0	WPADGetStatus	b WUDGetStatus (805B4A10, signature)
+805A27A0	WPADSetSimpleSyncCallback	medium: b 805B4B10, which swaps a callback at 807A9FE4 under interrupts and returns the old one; called only by the Home Button menu
+805A2780	WPADStartFastSimpleSync	medium: b 805B4CB0 = sync start 805B4B60(1,-1,0,1); fast vs normal variant not proven; called only by the Home Button menu
+805A2790	WPADStopSimpleSync	medium: b 805B4D60, which acts only while the WUD sync state (+0x708) is 3; called only by the Home Button menu
+805A3C90	WPADDisconnect	(chan) on a connected channel marks +0xB7E, turns the LEDs off (805A4440) with callback 805A3C60, which closes the HID link (b 805BFFC0 with the device handle +0x907)
+805A3FB0	WPADSetDataFormat	(chan, fmt): -1 without controller, -2 if busy, 0 if fmt equals the current format at +0x8FC, otherwise queues the report-mode command
+805A40D0	WPADGetInfoAsync	(chan, info, cb): sets busy byte +0xB84, keeps cb at +0xB80 and queues output report 0x15 (status request) carrying the info pointer
+805A4B50	WPADControlSpeaker	(chan, cmd, cb): state at +0x83C, copies the 7-byte speaker config 00 00 D0 07 40 0C 0E from 807F9C50, sends reports 0x14/0x19/0x16; called by CRI audio (cri_audio_wpad) and the Home Button menu
+805A4B00	WPADIsSpeakerEnabled	(chan) returns +0x83C, the speaker state WPADControlSpeaker tests; one of three signature look-alikes (small getters share a signature)
+805A6150	WPADGetSpeakerVolume	returns the byte at -0x4DB9(r13) that WPADSetSpeakerVolume writes; one of three signature candidates
+805A6190	WPADSetSpeakerVolume	clamps its argument to 0..0x7F and stores it at -0x4DB9(r13) between OSDisableInterrupts and OSRestoreInterrupts
+805A63B0	WPADSendStreamData	right after WPADCanSendStreamData (805A6320, signature), calls IsBusyStream, 0x210 bytes as in Dragon Quest Swords' SDK
+805E6150	KPADSetPosParam	medium-high: first of four float-pair setters on the KPAD channel block (807E0D38, stride 0x688): +0xF0/+0xF4
+805E6170	KPADSetAccParam	medium-high: second of the four setters: +0xF8/+0xFC (same order as Victorious per the DQS port)
+8054AE10	OSRestart	(resetCode): OSGetAppType, __OSUnRegisterStateEvent, shuts devices down, reboots by app type (0x81 -> 8054FF30, 0x80 -> 8054A9A0), else hot reset and OSPanic at OSReset.c:0x40A __OSHotReset(): Falied; called by the game reset handlers 803FB47C and 8000D078
+8054ACF0	OSShutdownSystem	SCInit, waits for SC, SCGetIdleMode (8059D5F0), __OSUnRegisterStateEvent, picks the shutdown type 1/2/3 from the idle mode; called by both game power handlers (803FB47C, 803FB8E4)
+8054A9A0	__OSReboot	medium: (resetCode, global) from OSRestart's 0x80 branch; disables interrupts and hands over to __OSBootDol (80547430, signature)
+80585768	__write_console	write_proc of MSL stdin/stdout/stderr FILEs at 8070E398/8070E3E8/8070E438 (read 80590050, close 80585838); OSGetConsoleType, InitializeUART(57600), WriteUARTN
+80542BC0	OSInit	registers __OSVersion (<< RVL_SDK - OS ...)
+8055BBB0	VIInit	registers __VIVersion
+805529E0	DVDInit	registers __DVDVersion
+8056E8F0	GXInit	registers __GXVersion
+8055FF50	AXInit	registers __AXVersion
+8058BF10	SIInit	registers __SIVersion
+80549540	__OSSetInterruptHandler	VIInit calls it with (0x18, __VIRetraceHandler)
+80558390	__DVDShowFatalMessage	picks the localised DVD error text by SCGetLanguage and calls OSFatal
+80545800	OSPanic	called with (OSReset.c, line, message) after every failed reset path
+804F7EF4	pt_SystemMainLoop	the game's main loop, once per VI field: virtual method (vtable +0x44C, slot 2) of the system object at [807F2058], called by 804C30D0; draw flag +0x448 = field counter [807F227C] % (60 / render rate +0x438); logic steps per field = 1 + carry of +0x47C += +0x47E (4.12 fixed point); render only with the flag set and no frame pending [807F2279]; one VIWaitForRetrace per pass
+804F71A8	pt_SystemInit	the system object's init: WPADRegisterAllocator, KPADInit, DVDInit, GXInit; render rate +0x438 = 50 for video modes 4/5; step increment +0x47E = 0x333 (0.2 steps a field) when VIGetTvFormat is PAL (1), else 0
+804C2628	pt_SystemBaseCtor	the engine's system base constructor: vtable +0x44C = 806EB280, logic rate +0x434 = 60, render rate +0x438 = 60, draw flag +0x448 = 1
+804C30D0	pt_SystemTask	calls vtable slot 2 (+8) of the system object [807F2058] (pt_SystemMainLoop) and re-registers itself with 8042F400
+8054D770	OSGetTick	mftb r3; blr
+8054D6A0	OSSleepTicks	medium: (r3:r4 ticks) creates an alarm (80543640), sets it (805438A0) with a handler, suspends the current thread (8054D1B0); called with 5 ms by the audio-queue wait (803AEC70)
+8055D2D0	VIGetRetraceCount	medium: returns the word at -0x51D4(r13); the main loop compares it with its last value for frame skipping
+8055F980	AIRegisterDMACallback	swaps the AI DMA callback at -0x5178(r13) under interrupts and returns the old one; AXInit and the game's audio stream (803AE5D4) register through it
+8034BA78	pt_StrapTask	the wrist-strap screen of the title scene (title_scene.cpp, Wii_Strap.aar): a task (registered by 8034B764) over the scene at [[r3]+0x10]; state +0xD0: 0 fade in (anim +0xA4 from 1 to 0, 30 frames), 1 wait for it, 2 wait 60 frames, 3 wait for A (or 20 s), 4 fade out and free the images, 5 ten frames, then 8034AD90 (the title)
+8025423C	pt_handler_8025423C	a handler reached only through a dispatch table (the game code's bctr tables at 80254150..80262294): it starts right after a blr/bctr/b, but discovery had folded it into the function before, so a jump through the table found no entry
+80254250	pt_handler_80254250	a handler reached only through a dispatch table (the game code's bctr tables at 80254150..80262294): it starts right after a blr/bctr/b, but discovery had folded it into the function before, so a jump through the table found no entry
+80254278	pt_handler_80254278	a handler reached only through a dispatch table (the game code's bctr tables at 80254150..80262294): it starts right after a blr/bctr/b, but discovery had folded it into the function before, so a jump through the table found no entry
+80254288	pt_handler_80254288	a handler reached only through a dispatch table (the game code's bctr tables at 80254150..80262294): it starts right after a blr/bctr/b, but discovery had folded it into the function before, so a jump through the table found no entry
+802543D4	pt_handler_802543D4	a handler reached only through a dispatch table (the game code's bctr tables at 80254150..80262294): it starts right after a blr/bctr/b, but discovery had folded it into the function before, so a jump through the table found no entry
+802543E4	pt_handler_802543E4	a handler reached only through a dispatch table (the game code's bctr tables at 80254150..80262294): it starts right after a blr/bctr/b, but discovery had folded it into the function before, so a jump through the table found no entry
+8025F4F4	pt_handler_8025F4F4	a handler reached only through a dispatch table (the game code's bctr tables at 80254150..80262294): it starts right after a blr/bctr/b, but discovery had folded it into the function before, so a jump through the table found no entry
+8025F510	pt_handler_8025F510	a handler reached only through a dispatch table (the game code's bctr tables at 80254150..80262294): it starts right after a blr/bctr/b, but discovery had folded it into the function before, so a jump through the table found no entry
+8025F524	pt_handler_8025F524	a handler reached only through a dispatch table (the game code's bctr tables at 80254150..80262294): it starts right after a blr/bctr/b, but discovery had folded it into the function before, so a jump through the table found no entry
+8025F558	pt_handler_8025F558	a handler reached only through a dispatch table (the game code's bctr tables at 80254150..80262294): it starts right after a blr/bctr/b, but discovery had folded it into the function before, so a jump through the table found no entry
+8025F56C	pt_handler_8025F56C	a handler reached only through a dispatch table (the game code's bctr tables at 80254150..80262294): it starts right after a blr/bctr/b, but discovery had folded it into the function before, so a jump through the table found no entry
+8025F580	pt_handler_8025F580	a handler reached only through a dispatch table (the game code's bctr tables at 80254150..80262294): it starts right after a blr/bctr/b, but discovery had folded it into the function before, so a jump through the table found no entry
+8025F5A8	pt_handler_8025F5A8	a handler reached only through a dispatch table (the game code's bctr tables at 80254150..80262294): it starts right after a blr/bctr/b, but discovery had folded it into the function before, so a jump through the table found no entry
+8025F70C	pt_handler_8025F70C	a handler reached only through a dispatch table (the game code's bctr tables at 80254150..80262294): it starts right after a blr/bctr/b, but discovery had folded it into the function before, so a jump through the table found no entry
+8025F738	pt_handler_8025F738	a handler reached only through a dispatch table (the game code's bctr tables at 80254150..80262294): it starts right after a blr/bctr/b, but discovery had folded it into the function before, so a jump through the table found no entry
+8025F74C	pt_handler_8025F74C	a handler reached only through a dispatch table (the game code's bctr tables at 80254150..80262294): it starts right after a blr/bctr/b, but discovery had folded it into the function before, so a jump through the table found no entry
+802611FC	pt_handler_802611FC	a handler reached only through a dispatch table (the game code's bctr tables at 80254150..80262294): it starts right after a blr/bctr/b, but discovery had folded it into the function before, so a jump through the table found no entry
+8026124C	pt_handler_8026124C	a handler reached only through a dispatch table (the game code's bctr tables at 80254150..80262294): it starts right after a blr/bctr/b, but discovery had folded it into the function before, so a jump through the table found no entry
+8026126C	pt_handler_8026126C	a handler reached only through a dispatch table (the game code's bctr tables at 80254150..80262294): it starts right after a blr/bctr/b, but discovery had folded it into the function before, so a jump through the table found no entry
+8026193C	pt_handler_8026193C	a handler reached only through a dispatch table (the game code's bctr tables at 80254150..80262294): it starts right after a blr/bctr/b, but discovery had folded it into the function before, so a jump through the table found no entry
+80261980	pt_handler_80261980	a handler reached only through a dispatch table (the game code's bctr tables at 80254150..80262294): it starts right after a blr/bctr/b, but discovery had folded it into the function before, so a jump through the table found no entry
+80662900	MOOpen	Mobiclip SDK, opens a movie: the "[MOOpen] Null movie pointer" message, returns -6 for a null movie; its only caller (803AE5D4) is the game's movie class
+80662A40	MOClose	Mobiclip SDK, closes a movie: the "[MOClose] movie was not opened" message, returns -6 for a null movie; its only caller is 803AE7A4
+800FE238	pt_ScreenFrameIn	the cutscene frame (the black bars that slide in): the script command ScreenFrameIn calls it (800B95E0, with 0 and 0x30), and so do 80257344, 80338A80, 80339A9C, 8034C5AC (with 500 ms and 0x30); it starts a screen effect, type 0xA, through 803EDFB0 and returns its handle, which every caller keeps and later hands to pt_ScreenFrameOut only if it is not 0
+800FE2D4	pt_ScreenFrameOut	the cutscene frame going away: the script command ScreenFrameOut (800B96A0, after checking the handle is not 0) and the same game code; (handle, time) to 803EE7A8
+800B29FC	pt_NowLoadingStart	the script command NowLoadingStart (registered at 800A64D8): it starts the loading window (803516D8 sets its +0x20, the only caller), the screen with smoke and the emblem between areas, which brings black bars with it
+800B2B3C	pt_NowLoadingEnd	the script command NowLoadingEnd (registered at 800A64EC): it asks the loading window to end (80351708 sets its +0x40, the only caller)
+803E0410	pt_InputShakeUpdate	the input mapper's update: reads the Remote's and the Nunchuk's acc_value (KPADStatus +0x18 and ex_status.fs +0x74, through 804F1FF8 and 804F2014) into +0x254 and +0x258, and counts the frames each is at or over its threshold (floats at r13-0x5E08 and -0x5E04: 3.0 and 1.853 by default, set by 803DFD00 and 803DFD14) in +0x25C and +0x260; a count of 1 presses the shake's virtual button

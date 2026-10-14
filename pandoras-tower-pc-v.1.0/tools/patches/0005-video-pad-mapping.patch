@@ -1,0 +1,85 @@
+diff --git a/runtime/video.cpp b/runtime/video.cpp
+index 15df9df..c1834b5 100644
+--- a/runtime/video.cpp
++++ b/runtime/video.cpp
+@@ -1006,6 +1006,12 @@ std::vector<Binding> bindings;
+ int keys_input = INPUT_MODE_AUTO;                        // the key file's Input
+ bool face_by_label = false;                         // the key file's Face Buttons = Label
+ float dead_zone = 0.15f;                            // the key file's Dead Zone: of the sticks' travel, radial
++// the key file's "Pad <button> = <pad button>, ..." lines ([Classic Controller]): the pad's
++// buttons and triggers to the Classic's, instead of the fixed layout. Any such line replaces
++// the whole fixed layout (the sticks stay as they are).
++struct PadBind { int button; int axis; uint32_t bits; };    // button or trigger axis (-1 if none)
++std::vector<PadBind> pad_binds;
++bool pad_custom = false;
+ 
+ const char* DEFAULT_KEYS =
+     "# wiiboot's keys: each Wii Remote button, then the keys and mouse buttons that press it.\n"
+@@ -1131,6 +1137,39 @@ bool parse_keys(const std::string& text, const std::string& path, bool remote, b
+                 continue;
+             }
+         }
++        if (in_classic && eq != std::string::npos && lhs.size() > 4 && SDL_strncasecmp(lhs.c_str(), "Pad ", 4) == 0) {
++            std::string target = trim(lhs.substr(4));
++            const Btn* cb = nullptr;
++            for (const Btn& c : cl_buttons)
++                if (SDL_strcasecmp(target.c_str(), c.name) == 0 && c.bits < kStick) cb = &c;
++            if (!cb) { rt_log("video: %s:%d: Pad takes a Classic button (A B X Y L R ZL ZR Plus Minus Home Up Down Left Right)", path.c_str(), line); continue; }
++            struct PadName { const char* name; int button; int axis; };
++            static const PadName pad_names[] = {
++                {"South", SDL_GAMEPAD_BUTTON_SOUTH, -1}, {"East", SDL_GAMEPAD_BUTTON_EAST, -1},
++                {"West", SDL_GAMEPAD_BUTTON_WEST, -1}, {"North", SDL_GAMEPAD_BUTTON_NORTH, -1},
++                {"Back", SDL_GAMEPAD_BUTTON_BACK, -1}, {"Guide", SDL_GAMEPAD_BUTTON_GUIDE, -1},
++                {"Start", SDL_GAMEPAD_BUTTON_START, -1}, {"Left Stick", SDL_GAMEPAD_BUTTON_LEFT_STICK, -1},
++                {"Right Stick", SDL_GAMEPAD_BUTTON_RIGHT_STICK, -1}, {"Left Shoulder", SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, -1},
++                {"Right Shoulder", SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, -1}, {"Dpad Up", SDL_GAMEPAD_BUTTON_DPAD_UP, -1},
++                {"Dpad Down", SDL_GAMEPAD_BUTTON_DPAD_DOWN, -1}, {"Dpad Left", SDL_GAMEPAD_BUTTON_DPAD_LEFT, -1},
++                {"Dpad Right", SDL_GAMEPAD_BUTTON_DPAD_RIGHT, -1}, {"Misc", SDL_GAMEPAD_BUTTON_MISC1, -1},
++                {"Touchpad", SDL_GAMEPAD_BUTTON_TOUCHPAD, -1},
++                {"Left Trigger", -1, SDL_GAMEPAD_AXIS_LEFT_TRIGGER}, {"Right Trigger", -1, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER}};
++            if (!pad_custom) { pad_binds.clear(); pad_custom = true; }
++            for (size_t p = 0; p <= rest.size();) {
++                size_t q = rest.find(',', p);
++                if (q == std::string::npos) q = rest.size();
++                std::string name = trim(rest.substr(p, q - p));
++                p = q + 1;
++                if (name.empty()) continue;
++                const PadName* pn = nullptr;
++                for (const PadName& n : pad_names)
++                    if (SDL_strcasecmp(name.c_str(), n.name) == 0) pn = &n;
++                if (!pn) { rt_log("video: %s:%d: no pad button named \"%s\"", path.c_str(), line, name.c_str()); continue; }
++                pad_binds.push_back(PadBind{pn->button, pn->axis, cb->bits});
++            }
++            continue;
++        }
+         const Btn* b = nullptr;
+         if (eq != std::string::npos) {
+             if (in_classic) {
+@@ -1184,6 +1223,8 @@ void load_keys(const std::string& path) {
+         }
+     }
+     bindings.clear();
++    pad_binds.clear();
++    pad_custom = false;
+     if (!parse_keys(text, path, true, true)) parse_keys(DEFAULT_KEYS, "(the default keys)", false, true);
+ }
+ 
+@@ -1235,6 +1276,18 @@ void stick(SDL_Gamepad* g, SDL_GamepadAxis ax, SDL_GamepadAxis ay, float& x, flo
+ ClassicState classic_from_pad(SDL_Gamepad* g) {
+     ClassicState s;
+     s.connected = true;
++    if (pad_custom) {
++        for (const PadBind& b : pad_binds) {
++            bool on = b.button >= 0 ? SDL_GetGamepadButton(g, (SDL_GamepadButton)b.button)
++                                    : axis(g, (SDL_GamepadAxis)b.axis) > 0.5f;
++            if (on) s.buttons |= b.bits;
++        }
++        s.lt = s.buttons & CL_L ? 1.0f : 0.0f;
++        s.rt = s.buttons & CL_R ? 1.0f : 0.0f;
++        stick(g, SDL_GAMEPAD_AXIS_LEFTX, SDL_GAMEPAD_AXIS_LEFTY, s.lx, s.ly);
++        stick(g, SDL_GAMEPAD_AXIS_RIGHTX, SDL_GAMEPAD_AXIS_RIGHTY, s.rx, s.ry);
++        return s;
++    }
+     static const struct { SDL_GamepadButton b; uint32_t bit; } fixed[] = {
+         {SDL_GAMEPAD_BUTTON_DPAD_UP, CL_UP}, {SDL_GAMEPAD_BUTTON_DPAD_DOWN, CL_DOWN},
+         {SDL_GAMEPAD_BUTTON_DPAD_LEFT, CL_LEFT}, {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, CL_RIGHT},

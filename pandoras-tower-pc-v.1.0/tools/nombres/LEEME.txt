@@ -1,0 +1,8 @@
+Los nombres de las funciones de cada ejecutable analizado (el main.dol de cada
+versión, por su SHA-1), ya calculados: setup.sh los usa en lugar de volver a
+calcularlos (tools/sigmatch.py y tools/names.py tardan unos minutos).
+
+Son solo direcciones y nombres (como tools/names-manual.tsv), sin nada del
+juego. Cada .clave es el SHA-1 de los archivos de los que salen (el
+names-manual de esa versión, names.py y sigmatch.py): si cambia alguno,
+setup.sh los vuelve a calcular y deja aquí los nuevos.

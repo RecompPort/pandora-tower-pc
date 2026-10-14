@@ -1,0 +1,68 @@
+diff --git a/runtime/video.cpp b/runtime/video.cpp
+index 9f2c54a..a525a8c 100644
+--- a/runtime/video.cpp
++++ b/runtime/video.cpp
+@@ -1269,11 +1269,40 @@ namespace {
+ // centred; of its 480 lines (NTSC) VI scans the XFB out over its active ones,
+ // centred too (360 for a game letterboxing 16:9 on a 4:3 screen).
+ struct Rect { float x, y, w, h; };
++// WIIKIT_FIT: tv (that), fill (the picture as large as it covers the window,
++// its shape kept: what overflows is cut), stretch (the picture is the window).
++// WIIKIT_CROP=N: N % of the picture cut at each edge (the black borders some
++// games draw inside it), the rest scaled up. Both leave the pointer on the picture.
++int fit_mode() {
++    static const int m = [] {
++        const char* e = std::getenv("WIIKIT_FIT");
++        if (e && !SDL_strcasecmp(e, "fill")) return 1;
++        if (e && !SDL_strcasecmp(e, "stretch")) return 2;
++        return 0;
++    }();
++    return m;
++}
++float crop_frac() {
++    static const float c = [] {
++        const char* e = std::getenv("WIIKIT_CROP");
++        float v = e ? (float)std::atof(e) : 0.0f;
++        return std::min(20.0f, std::max(0.0f, v)) / 100.0f;
++    }();
++    return c;
++}
+ Rect picture_rect(float w, float h) {
+     float aspect = opt.widescreen ? 16.0f / 9 : 4.0f / 3;
++    float lines = (float)std::min<uint32_t>(vi_lines.load(), 480);
++    if (fit_mode() == 2) return {0, 0, w, h};
++    if (fit_mode() == 1) {                              // cover the window
++        float pa = aspect * 480.0f / std::max(1.0f, lines);   // the picture's own shape
++        float pw = w, ph = w / pa;
++        if (ph < h) { ph = h; pw = h * pa; }
++        return {(w - pw) / 2, (h - ph) / 2, pw, ph};
++    }
+     float sw = w, sh = w / aspect;
+     if (sh > h) { sh = h; sw = h * aspect; }
+-    float ph = sh * (float)std::min<uint32_t>(vi_lines.load(), 480) / 480;
++    float ph = sh * lines / 480;
+     return {(w - sw) / 2, (h - ph) / 2, sw, ph};
+ }
+ 
+@@ -1699,8 +1728,9 @@ void update_pad() {
+         // -1..1 spans the picture as present() shows it, so that the game's
+         // cursor lands under the mouse
+         Rect r = picture_rect((float)ww, (float)wh);
+-        p.x = (mx - r.x) / r.w * 2 - 1;
+-        p.y = (my - r.y) / r.h * 2 - 1;
++        float k = 1.0f - 2.0f * crop_frac();            // the picture shown is the middle of the XFB
++        p.x = ((mx - r.x) / r.w * 2 - 1) * k;
++        p.y = ((my - r.y) / r.h * 2 - 1) * k;
+         p.pointer = p.x >= -1 && p.x <= 1 && p.y >= -1 && p.y <= 1;
+     }
+     // over the picture the game draws its own cursor, as on the Wii
+@@ -1792,7 +1822,8 @@ void present() {
+         int dx = (int)std::lround(r.x), dy = (int)std::lround(r.y);
+         int dw = (int)std::lround(r.w), dh = (int)std::lround(r.h);
+         glNamedFramebufferTexture(copy_fbo, GL_COLOR_ATTACHMENT0, t.name, 0);
+-        glBlitNamedFramebuffer(copy_fbo, 0, 0, 0, t.w, t.h, dx, dy + dh, dx + dw, dy,   // top row first
++        int cx = (int)std::lround(t.w * crop_frac()), cy = (int)std::lround(t.h * crop_frac());
++        glBlitNamedFramebuffer(copy_fbo, 0, cx, cy, t.w - cx, t.h - cy, dx, dy + dh, dx + dw, dy,   // top row first
+                                GL_COLOR_BUFFER_BIT, GL_LINEAR);
+     }
+     if (opt.dump_dir && cnt.presents % (uint64_t)opt.dump_every == 0 && ww > 0 && wh > 0) {

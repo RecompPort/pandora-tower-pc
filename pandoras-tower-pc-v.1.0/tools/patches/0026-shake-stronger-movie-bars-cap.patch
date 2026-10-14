@@ -1,0 +1,75 @@
+diff --git a/runtime/video.cpp b/runtime/video.cpp
+index 5df2447..045d1bf 100644
+--- a/runtime/video.cpp
++++ b/runtime/video.cpp
+@@ -1748,7 +1748,12 @@ void update_pad() {
+                 if (vx * fvx + vy * fvy < 0) {                       // it turned back
+                     if (now - turn1 < std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(kShakeWithin))) {
+                         static int told = 0;
+-                        if (now >= shake_until && told < 5) { ++told; rt_log("video: the mouse shaken (Mouse Shake)"); }
++                        if (now >= shake_until && told < 5) {
++                            ++told;
++                            bool bound = std::any_of(bindings.begin(), bindings.end(), [](const Binding& k) { return k.mshake; });
++                            rt_log(bound ? "video: the mouse shaken: the Remote shakes (Mouse Shake)"
++                                         : "video: the mouse shaken, but Mouse Shake is in no line of the key file: nothing shakes");
++                        }
+                         shake_until = now + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(kShakeHold));
+                     }
+                     turn1 = now;
+@@ -2036,6 +2041,10 @@ void find_letterbox(const Tex& t) {
+             fresh_tries = 0;
+             target_v = (float)v / (float)t.h;
+             target_h = (float)hz / (float)t.w;
++            // a movie's bars measured larger than the widest letterbox of the films
++            // (2.39:1 in 16:9, 12.8 %) by up to 6 %: the dark picture next to them
++            // read as bar; the letterbox is what is cut, not the picture
++            if (hint == 1 && target_v > 0.128f && target_v < 0.19f) target_v = 0.122f;
+             if (v > 0 || hz > 0) remember_movie_bars(kind, target_v, target_h);
+             seen_v = v; seen_h = hz; agree = 3;
+             letterbox.store(target_v);
+diff --git a/runtime/wpad.cpp b/runtime/wpad.cpp
+index 890dccb..2fcf5eb 100644
+--- a/runtime/wpad.cpp
++++ b/runtime/wpad.cpp
+@@ -9,8 +9,8 @@
+ // mouse as the pointer, keys for the buttons); the other channels are empty.
+ // The Remote is held still, pointing at the screen, gravity along -y,
+ // except while it is shaken: then it swings back and forth four times a
+-// second (kShakeHz), its acceleration along x and z up to 3.4 and 3 g
+-// (acc_value up to 4.6 g, at rest 1 g), so that both what games compare with
++// second (kShakeHz), its acceleration along x, y and z up to 3.4, 3.5 and 3 g
++// (acc_value up to 5.7 g, at rest 1 g), so that both what games compare with
+ // a threshold are there: acc_speed, the change of acceleration between
+ // samples (Victorious: 0.4, over two frames), and acc_value going over a
+ // threshold and back under it, a shake each time (Pandora's Tower: 3 g for
+@@ -157,7 +157,8 @@ void hle_WPADProbe(PPCContext& c) {                  // (chan, u32* type)
+     ret(c, here ? 0 : (uint32_t)WPAD_ERR_NO_CONTROLLER);
+ }
+ 
+-struct Prev { uint32_t hold = 0, cl_hold = 0; float x = 0, y = 0; float acc[3] = {0, -1, 0}; float fs_acc[3] = {0, -1, 0}; };
++struct Prev { uint32_t hold = 0, cl_hold = 0; float x = 0, y = 0; float acc[3] = {0, -1, 0}; float fs_acc[3] = {0, -1, 0};
++              bool told_shake = false; };
+ constexpr double kShakeHz = 4.0;
+ 
+ // a shake's swing (-1..1) at this moment: a cosine from its start, so that its
+@@ -193,7 +194,19 @@ void hle_KPADRead(PPCContext& c) {
+     pv.hold = p.buttons;
+     float acc[3] = {0, -1, 0};                        // gravity, the Remote level
+     if (p.tilt) { acc[1] = 0; acc[2] = (float)p.tilt; p.pointer = false; }   // raised: along its length
+-    if (float w = remote_swing[chan].at(p.shake)) { acc[0] = 3.4f * w; acc[2] = 3.0f * w; }
++    if (float w = remote_swing[chan].at(p.shake)) {
++        // along all three axes, as a real shake: acc_value from 1 g at rest up to 4.8 and 5.7 g
++        acc[0] = 3.4f * w; acc[1] = -1.0f - 2.5f * w; acc[2] = 3.0f * w;
++        static int told = 0;
++        if (std::fabs(w) > 0.99f && !pv.told_shake && told < 5) {
++            ++told;
++            rt_log("wpad: the Remote shaken (channel %u, acc_value up to %.1f g)", chan + 1,
++                   std::sqrt(acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2]));
++        }
++        pv.told_shake = true;
++    } else {
++        pv.told_shake = false;
++    }
+     float d2 = 0, a2 = 0;
+     for (int i = 0; i < 3; ++i) {
+         stf(s + 0x0C + 4 * i, acc[i]);                // acc

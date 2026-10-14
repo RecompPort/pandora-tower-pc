@@ -1,0 +1,172 @@
+diff --git a/runtime/video.cpp b/runtime/video.cpp
+index 045d1bf..b741636 100644
+--- a/runtime/video.cpp
++++ b/runtime/video.cpp
+@@ -31,6 +31,7 @@
+ #include <mutex>
+ #include <string>
+ #include <unordered_map>
++#include <unordered_set>
+ #include <vector>
+ 
+ #define WIIKIT_GL_DEFINE(T, n) T n = nullptr;
+@@ -129,6 +130,14 @@ float aniso = 1.0f;
+ struct PendingProgram { GLuint p; uint64_t hash; };
+ std::unordered_map<std::string, PendingProgram> pending_by_source;   // being linked
+ std::unordered_map<std::string, std::string> pending_key;           // register key -> its source
++// GL_KHR_parallel_shader_compile: links run in the driver's threads (both modes)
++bool parallel_links = false;
++// The programs the game has used, by their code (SHADER_CACHE/programas.txt, with
++// WIIKIT_SHADER_LIST's too): at start, those not in the cache (a fresh cache, or
++// a new driver) are linked in the driver's threads while the game boots, so the
++// first time they are drawn they are already there
++std::unordered_set<std::string> listed;
++std::vector<std::string> warming;                                  // being linked at start
+ 
+ struct Counters { uint64_t frames, presents, draws, programs, linked, cached; } cnt;
+ bool dump_ps = false;                              // WIIKIT_SHADERDUMP: log the next uniforms
+@@ -452,6 +461,95 @@ bool poll_pending(const std::string& source, GLuint& out) {
+     return true;
+ }
+ 
++// a program's code in the list (SHADER_CACHE/programas.txt), once:
++// "@@ <vertex length> <fragment length>", a newline, the two sources, a newline
++void remember(const std::string& source) {
++    if (opt.shader_cache.empty() || !listed.insert(source).second) return;
++    static FILE* f = nullptr;
++    if (!f) {
++        std::error_code ec;
++        std::filesystem::create_directories(opt.shader_cache, ec);
++        f = std::fopen((opt.shader_cache + "/programas.txt").c_str(), "ab");
++        if (!f) return;
++    }
++    size_t cut = source.find('\0');
++    if (cut == std::string::npos) return;
++    std::fprintf(f, "@@ %zu %zu\n", cut, source.size() - cut - 1);
++    std::fwrite(source.data(), 1, cut, f);
++    std::fwrite(source.data() + cut + 1, 1, source.size() - cut - 1, f);
++    std::fputc('\n', f);
++    std::fflush(f);
++}
++
++void read_list(const std::string& path, std::vector<std::string>& out) {
++    FILE* f = std::fopen(path.c_str(), "rb");
++    if (!f) return;
++    std::string all;
++    char buf[65536];
++    for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) all.append(buf, n);
++    std::fclose(f);
++    size_t at = 0;
++    while (at < all.size()) {
++        size_t nl = all.find('\n', at);
++        if (nl == std::string::npos) break;
++        unsigned long long lv = 0, lf = 0;
++        if (std::sscanf(all.c_str() + at, "@@ %llu %llu", &lv, &lf) != 2 || nl + 1 + lv + lf > all.size()) break;
++        out.push_back(all.substr(nl + 1, lv) + '\0' + all.substr(nl + 1 + lv, lf));
++        at = nl + 1 + lv + lf + 1;
++    }
++}
++
++// at start: the listed programs from the cache now (they are then ready for their
++// first draw), and the rest linked in the driver's threads
++void warm_start() {
++    std::vector<std::string> all;
++    if (!opt.shader_cache.empty()) read_list(opt.shader_cache + "/programas.txt", all);
++    size_t own = all.size();
++    if (const char* extra = std::getenv("WIIKIT_SHADER_LIST"); extra && *extra) read_list(extra, all);
++    size_t cached = 0, linking = 0;
++    for (size_t i = 0; i < all.size(); ++i) {
++        const std::string& source = all[i];
++        if (i < own) listed.insert(source);
++        if (programs_by_source.count(source) || pending_by_source.count(source)) continue;
++        uint64_t hash = source_hash(source);
++        if (GLuint p = load_program(hash)) { programs_by_source.emplace(source, p); ++cnt.cached; ++cached; continue; }
++        if (!parallel_links) continue;                       // linking them here would hold the start up
++        size_t cut = source.find('\0');
++        pending_by_source.emplace(source, PendingProgram{link_async(source.substr(0, cut), source.substr(cut + 1)), hash});
++        warming.push_back(source);
++        ++linking;
++    }
++    if (!all.empty())
++        rt_log("video: %zu programs known from before: %zu from the shader cache, %zu being linked in the background",
++               all.size(), cached, linking);
++}
++
++bool poll_pending(const std::string& source, GLuint& out);
++
++// each frame: the programs linked at start that are done join the others
++void warm_poll() {
++    if (warming.empty()) return;
++    int done = 0;
++    for (size_t i = 0; i < warming.size() && done < 16;) {
++        GLuint p = 0;
++        auto q = pending_by_source.find(warming[i]);
++        GLint ready = 1;
++        if (q != pending_by_source.end()) glGetProgramiv(q->second.p, GL_COMPLETION_STATUS_KHR, &ready);
++        if (ready) { poll_pending(warming[i], p); warming[i] = std::move(warming.back()); warming.pop_back(); ++done; }
++        else ++i;
++    }
++    if (warming.empty()) rt_log("video: the programs known from before are all linked");
++}
++
++// a program being linked, waited for (waiting for shaders: nothing is skipped)
++GLuint wait_pending(const std::string& source) {
++    auto q = pending_by_source.find(source);
++    if (q != pending_by_source.end()) { GLint ok = 0; glGetProgramiv(q->second.p, GL_LINK_STATUS, &ok); }   // waits
++    GLuint p = 0;
++    while (!poll_pending(source, p)) {}
++    return p;
++}
++
+ GLuint program_for(uint8_t vflags) {
+     std::string key = gx_shader_key(bp, xf, vflags);
+     auto it = programs.find(key);
+@@ -467,13 +565,21 @@ GLuint program_for(uint8_t vflags) {
+     gx_shader_gen(bp, xf, vflags, vs, fs);
+     std::string source = vs + '\0' + fs;
+     if (auto same = programs_by_source.find(source); same != programs_by_source.end()) {
++        remember(source);
+         programs.emplace(std::move(key), same->second);
+         return same->second;
+     }
+-    if (pending_by_source.count(source)) {                    // the same code, another key
++    if (pending_by_source.count(source)) {                    // the same code, another key (or linked at start)
++        remember(source);
++        if (!async_shaders) {
++            GLuint p = wait_pending(source);
++            programs.emplace(std::move(key), p);
++            return p;
++        }
+         pending_key.emplace(std::move(key), std::move(source));
+         return 0;
+     }
++    remember(source);
+     uint64_t hash = source_hash(source);
+     GLuint p = load_program(hash);
+     if (p) ++cnt.cached;
+@@ -2122,6 +2228,7 @@ namespace {
+ 
+ void present() {
+     ++cnt.presents;
++    warm_poll();
+     int ww = 0, wh = 0;
+     SDL_GetWindowSizeInPixels(win, &ww, &wh);
+     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+@@ -2382,11 +2489,14 @@ void video_run(const char* title) {
+         const char* a = std::getenv("WIIKIT_ASYNC_SHADERS");
+         using MaxThreads = void(APIENTRY*)(GLuint);  // glMaxShaderCompilerThreadsKHR
+         auto threads = reinterpret_cast<MaxThreads>(SDL_GL_GetProcAddress("glMaxShaderCompilerThreadsKHR"));
+-        if (!(a && a[0] == '0') && threads && SDL_GL_ExtensionSupported("GL_KHR_parallel_shader_compile")) {
++        if (threads && SDL_GL_ExtensionSupported("GL_KHR_parallel_shader_compile")) {
+             threads(0xFFFFFFFFu);                    // as many as the driver likes
+-            async_shaders = true;
+-            rt_log("video: shaders linked asynchronously (WIIKIT_ASYNC_SHADERS=0 to wait for them)");
++            parallel_links = true;
++            async_shaders = !(a && a[0] == '0');
+         }
++        rt_log(async_shaders ? "video: new shaders linked asynchronously: what uses them is skipped until they are ready"
++                             : "video: new shaders waited for: nothing is skipped (a pause the first time one is seen)");
++        warm_start();
+     }
+     if (const char* d = std::getenv("WIIKIT_INTERP"); d && d[0] == '1') {
+         interp_on = true;

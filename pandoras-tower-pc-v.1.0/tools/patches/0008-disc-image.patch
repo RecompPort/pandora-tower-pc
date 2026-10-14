@@ -1,0 +1,516 @@
+diff --git a/runtime/boot.cpp b/runtime/boot.cpp
+index 3941f3b..d47aca9 100644
+--- a/runtime/boot.cpp
++++ b/runtime/boot.cpp
+@@ -36,14 +36,14 @@ uint32_t g_bus_mhz = 243;
+ 
+ uint32_t boot_disc(const char* extract_dir, bool eurgb60) {
+     std::string root = extract_dir;
+-    if (!disc_open(extract_dir)) rt_die("%s: no sys/boot.bin and sys/fst.bin", extract_dir);
++    if (!disc_open(extract_dir)) rt_die("%s: no sys/boot.bin and sys/fst.bin, and not a disc image", extract_dir);
+     g_gamecube = disc_is_gamecube();
+     if (g_gamecube) g_bus_mhz = 162;
+     const int shift = g_gamecube ? 0 : 2;          // boot.bin's offsets: >> 2 on the Wii
+-    uint32_t entry = mem_load_dol((root + "/sys/main.dol").c_str());
+-    if (!entry) rt_die("%s/sys/main.dol: cannot load", extract_dir);
++    uint32_t entry = mem_load_dol_data(disc_sysfile("sys/main.dol"));
++    if (!entry) rt_die("%s: sys/main.dol: cannot load", extract_dir);
+     const std::vector<uint8_t>& boot = disc_boot();
+-    std::vector<uint8_t> bi2 = slurp(root + "/sys/bi2.bin"), tmd = slurp(root + "/tmd.bin");
++    std::vector<uint8_t> bi2 = disc_sysfile("sys/bi2.bin"), tmd = disc_sysfile("tmd.bin");
+     const std::vector<uint8_t>& fst = disc_fst();
+ 
+     // BI2 and the FST at the top of MEM1; the arena ends below them
+@@ -68,7 +68,7 @@ uint32_t boot_disc(const char* extract_dir, bool eurgb60) {
+     // (disc/region.bin: 0 Japan, 1 USA, 2 Europe, 4 Korea), else the game
+     // id's fourth letter (E, J, K, W: NTSC; the others PAL)
+     // (a GameCube disc: BI2's u32 at 0x18, same values)
+-    std::vector<uint8_t> reg = slurp(root + "/disc/region.bin");
++    std::vector<uint8_t> reg = disc_sysfile("disc/region.bin");
+     if (g_gamecube && bi2.size() >= 0x1C) reg.assign(bi2.begin() + 0x18, bi2.begin() + 0x1C);
+     const bool pal = reg.size() >= 4 ? be32(reg.data()) == 2 :
+                      !std::strchr("EJKW", boot[3]);
+diff --git a/runtime/disc.cpp b/runtime/disc.cpp
+index 356b1e4..5f1c9f9 100644
+--- a/runtime/disc.cpp
++++ b/runtime/disc.cpp
+@@ -1,4 +1,5 @@
+-// wiikit runtime — the game's DATA partition, served from an extracted tree.
++// wiikit runtime — the game's DATA partition, served from an extracted tree
++// or straight from a disc image (.iso, decrypted as it is read).
+ //
+ // `python -m wiikit.disc GAME.wbfs --extract DIR` writes sys/ (boot.bin,
+ // bi2.bin, apploader.img, main.dol, fst.bin) and files/. The partition is
+@@ -12,6 +13,8 @@
+ #include <algorithm>
+ #include <cstring>
+ #include <map>
++#include <filesystem>
++#include <mutex>
+ #include <vector>
+ #ifndef _WIN32
+ #define _fseeki64 fseeko
+@@ -69,10 +72,253 @@ void walk(const std::string& root) {
+     }
+ }
+ 
++// ---- a disc image ---------------------------------------------------------------------------------
++// A Wii image: the partition table at 0x40000 (four groups: u32 count, u32
++// table offset >> 2; each entry u32 offset >> 2, u32 type, 0 = DATA). The DATA
++// partition starts with its ticket (title key at 0x1BF, encrypted with the
++// common key 0x1F1 names, IV the title id at 0x1DC and eight zeros), then
++// 0x2A4/0x2A8 the TMD's size and offset >> 2, 0x2B8 the data's offset >> 2.
++// The data is 0x8000-byte clusters: 0x400 of hashes, then 0x7C00 of payload
++// encrypted with the title key, its IV at 0x3D0 of the still encrypted
++// hashes. Partition offsets count payload bytes. A GameCube image is its own
++// payload, unencrypted.
++// the common keys (retail, Korean, vWii) are not in this file: setup.sh writes
++// wii_keys.h from wiikit's own copy (wiikit/disc.py, COMMON_KEYS)
++#include "wii_keys.h"
++
++// AES-128, decryption only (FIPS-197), CBC
++struct Aes128 {
++    uint8_t rk[176];
++    static uint8_t sbox[256], inv[256], m9[256], m11[256], m13[256], m14[256];
++    static uint8_t xt(uint8_t x) { return (uint8_t)((x << 1) ^ ((x & 0x80) ? 0x1B : 0)); }
++    static uint8_t mul(uint8_t a, uint8_t b) { uint8_t r = 0; while (b) { if (b & 1) r ^= a; a = xt(a); b >>= 1; } return r; }
++    static void tables() {
++        static bool done = false;
++        if (done) return;
++        uint8_t p = 1, q = 1;
++        do {                                   // the S-box from the multiplicative inverse and the affine map
++            p = (uint8_t)(p ^ (p << 1) ^ ((p & 0x80) ? 0x1B : 0));
++            q ^= (uint8_t)(q << 1); q ^= (uint8_t)(q << 2); q ^= (uint8_t)(q << 4);
++            if (q & 0x80) q ^= 0x09;
++            uint8_t x = (uint8_t)(q ^ (uint8_t)(q << 1 | q >> 7) ^ (uint8_t)(q << 2 | q >> 6) ^ (uint8_t)(q << 3 | q >> 5) ^ (uint8_t)(q << 4 | q >> 4) ^ 0x63);
++            sbox[p] = x;
++        } while (p != 1);
++        sbox[0] = 0x63;
++        for (int i = 0; i < 256; ++i) {
++            inv[sbox[i]] = (uint8_t)i;
++            m9[i] = mul((uint8_t)i, 9); m11[i] = mul((uint8_t)i, 11); m13[i] = mul((uint8_t)i, 13); m14[i] = mul((uint8_t)i, 14);
++        }
++        done = true;
++    }
++    explicit Aes128(const uint8_t key[16]) {
++        tables();
++        std::memcpy(rk, key, 16);
++        uint8_t rc = 1;
++        for (int i = 16; i < 176; i += 4) {
++            uint8_t t[4] = {rk[i - 4], rk[i - 3], rk[i - 2], rk[i - 1]};
++            if (i % 16 == 0) {
++                uint8_t u = t[0];
++                t[0] = (uint8_t)(sbox[t[1]] ^ rc); t[1] = sbox[t[2]]; t[2] = sbox[t[3]]; t[3] = sbox[u];
++                rc = xt(rc);
++            }
++            for (int j = 0; j < 4; ++j) rk[i + j] = (uint8_t)(rk[i - 16 + j] ^ t[j]);
++        }
++    }
++    void block(uint8_t s[16]) const {          // one block, decrypted in place
++        for (int i = 0; i < 16; ++i) s[i] ^= rk[160 + i];
++        for (int r = 9; r >= 0; --r) {
++            uint8_t t[16];
++            for (int c = 0; c < 4; ++c)        // inverse shift rows and inverse S-box
++                for (int w = 0; w < 4; ++w) t[c * 4 + w] = inv[s[((c - w + 4) % 4) * 4 + w]];
++            for (int i = 0; i < 16; ++i) t[i] ^= rk[r * 16 + i];
++            if (r == 0) { std::memcpy(s, t, 16); break; }
++            for (int c = 0; c < 4; ++c) {      // inverse mix columns
++                uint8_t* m = t + c * 4;
++                uint8_t a0 = m[0], a1 = m[1], a2 = m[2], a3 = m[3];
++                s[c * 4 + 0] = (uint8_t)(m14[a0] ^ m11[a1] ^ m13[a2] ^ m9[a3]);
++                s[c * 4 + 1] = (uint8_t)(m9[a0] ^ m14[a1] ^ m11[a2] ^ m13[a3]);
++                s[c * 4 + 2] = (uint8_t)(m13[a0] ^ m9[a1] ^ m14[a2] ^ m11[a3]);
++                s[c * 4 + 3] = (uint8_t)(m11[a0] ^ m13[a1] ^ m9[a2] ^ m14[a3]);
++            }
++        }
++    }
++    void cbc(const uint8_t iv[16], uint8_t* d, size_t n) const {
++        uint8_t prev[16], cur[16];
++        std::memcpy(prev, iv, 16);
++        for (size_t o = 0; o + 16 <= n; o += 16) {
++            std::memcpy(cur, d + o, 16);
++            block(d + o);
++            for (int i = 0; i < 16; ++i) d[o + i] ^= prev[i];
++            std::memcpy(prev, cur, 16);
++        }
++    }
++};
++uint8_t Aes128::sbox[256], Aes128::inv[256], Aes128::m9[256], Aes128::m11[256], Aes128::m13[256], Aes128::m14[256];
++
++void log_read(uint64_t off, size_t n);                  // below: WIIKIT_DISCLOG
++void name_files();                                      // below: the image's files, by name
++
++struct Image {
++    FILE* f = nullptr;
++    bool wii = false;
++    uint64_t part = 0, data = 0;                   // the partition's offset, its data's (from the disc's start)
++    Aes128* key = nullptr;
++    std::vector<uint8_t> ticket, tmd, region;
++    std::mutex mx;
++    // the last decrypted clusters, oldest first
++    std::vector<std::pair<uint64_t, std::vector<uint8_t>>> cache;
++} g_img;
++bool g_is_image = false;
++
++bool raw(uint64_t off, void* dst, size_t n) {
++    if (_fseeki64(g_img.f, (int64_t)off, SEEK_SET) != 0) return false;
++    return std::fread(dst, 1, n, g_img.f) == n;
++}
++
++const std::vector<uint8_t>& cluster(uint64_t c) {      // payload of data cluster c, decrypted
++    for (auto& e : g_img.cache) if (e.first == c) return e.second;
++    if (g_img.cache.size() >= 64) g_img.cache.erase(g_img.cache.begin());
++    g_img.cache.emplace_back(c, std::vector<uint8_t>(0x7C00));
++    std::vector<uint8_t>& out = g_img.cache.back().second;
++    static std::vector<uint8_t> enc(0x8000);
++    if (!raw(g_img.data + c * 0x8000, enc.data(), 0x8000)) { std::fill(out.begin(), out.end(), 0); return out; }
++    std::memcpy(out.data(), enc.data() + 0x400, 0x7C00);
++    g_img.key->cbc(enc.data() + 0x3D0, out.data(), 0x7C00);
++    return out;
++}
++
++size_t image_read(uint64_t off, uint8_t* out, size_t n) {
++    std::lock_guard<std::mutex> lk(g_img.mx);
++    log_read(off, n);
++    if (!g_img.wii) { std::memset(out, 0, n); raw(off, out, n); return n; }
++    for (size_t done = 0; done < n;) {
++        uint64_t c = (off + done) / 0x7C00, in = (off + done) % 0x7C00;
++        size_t k = (size_t)std::min<uint64_t>(n - done, 0x7C00 - in);
++        std::memcpy(out + done, cluster(c).data() + in, k);
++        done += k;
++    }
++    return n;
++}
++
++std::vector<uint8_t> image_part(uint64_t off, size_t n) {
++    std::vector<uint8_t> d(n);
++    image_read(off, d.data(), n);
++    return d;
++}
++
++bool image_open(const char* path) {
++    g_img.f = std::fopen(path, "rb");
++    if (!g_img.f) { rt_log("disc: %s: cannot open it", path); return false; }
++    uint8_t h[0x440];
++    if (!raw(0, h, sizeof h)) { rt_log("disc: %s: cannot read its header", path); return false; }
++    if (be32(h + 0x200) == 0x4E4B4954u) {                 // "NKIT"
++        rt_log("disc: %s is an NKit image: restore it to a plain ISO (NKit, or Dolphin's Convert File)", path);
++        return false;
++    }
++    if (be32(h + 0x1C) == 0xC2339F3Du) {               // GameCube: the image is the payload
++        g_img.wii = false;
++        g_boot.assign(h, h + 0x440);
++        g_shift = 0;
++    } else if (be32(h + 0x18) == 0x5D1C9EA3u) {
++        g_img.wii = true;
++        uint8_t pt[32];
++        if (!raw(0x40000, pt, sizeof pt)) { rt_log("disc: %s: cannot read the partition table", path); return false; }
++        uint64_t data_part = 0;
++        for (int grp = 0; grp < 4 && !data_part; ++grp) {
++            uint32_t count = be32(pt + grp * 8), table = be32(pt + grp * 8 + 4);
++            for (uint32_t i = 0; i < count && i < 64; ++i) {
++                uint8_t e[8];
++                if (!raw((uint64_t)table * 4 + i * 8, e, 8)) { rt_log("disc: %s: cannot read the partition table", path); return false; }
++                if (be32(e + 4) == 0) { data_part = (uint64_t)be32(e) * 4; break; }
++            }
++        }
++        if (!data_part) { rt_log("disc: %s: no DATA partition", path); return false; }
++        g_img.part = data_part;
++        g_img.ticket.resize(0x2A4);
++        uint8_t ph[0x2C0];
++        if (!raw(data_part, ph, sizeof ph)) { rt_log("disc: %s: cannot read the DATA partition at %llX", path, (unsigned long long)data_part); return false; }
++        std::memcpy(g_img.ticket.data(), ph, 0x2A4);
++        uint32_t tmd_size = be32(ph + 0x2A4);
++        uint64_t tmd_off = (uint64_t)be32(ph + 0x2A8) * 4;
++        g_img.data = data_part + (uint64_t)be32(ph + 0x2B8) * 4;
++        g_img.tmd.resize(tmd_size);
++        if (tmd_size && !raw(data_part + tmd_off, g_img.tmd.data(), tmd_size)) { rt_log("disc: %s: cannot read the TMD", path); return false; }
++        g_img.region.resize(0x20);
++        raw(0x4E000, g_img.region.data(), 0x20);
++        uint8_t tkey[16], iv[16] = {};
++        std::memcpy(tkey, ph + 0x1BF, 16);
++        std::memcpy(iv, ph + 0x1DC, 8);
++        uint8_t ck = ph[0x1F1] < 3 ? ph[0x1F1] : 0;
++        Aes128 common(kCommonKeys[ck]);
++        common.cbc(iv, tkey, 16);
++        g_img.key = new Aes128(tkey);
++        g_boot = image_part(0, 0x440);
++        g_shift = 2;
++    } else {
++        rt_log("disc: %s: not a Wii or GameCube disc image", path);
++        return false;
++    }
++    uint64_t fst_off = (uint64_t)be32(&g_boot[0x424]) << g_shift, fst_size = (uint64_t)be32(&g_boot[0x428]) << g_shift;
++    if (fst_size < 12 || fst_size > (64u << 20)) {
++        rt_log("disc: %s: the FST (%llX bytes at %llX) makes no sense: is the image whole?", path, (unsigned long long)fst_size, (unsigned long long)fst_off);
++        return false;
++    }
++    g_fst = image_part(fst_off, (size_t)fst_size);
++    g_is_image = true;
++    name_files();
++    rt_log("disc: reading %s directly (%s)", path, g_img.wii ? "Wii, decrypted as it is read" : "GameCube");
++    return true;
++}
++
++// the image's files, from its FST: for WIIKIT_DISCLOG and for disc_check
++struct Named { uint64_t off, size; std::string name; };
++std::vector<Named> g_named;
++void name_files() {
++    g_named.clear();
++    const uint8_t* f = g_fst.data();
++    uint32_t total = be32(f + 8);
++    if ((uint64_t)total * 12 > g_fst.size()) return;
++    const char* names = (const char*)f + total * 12;
++    std::vector<std::pair<uint32_t, std::string>> stack{{total, ""}};
++    for (uint32_t i = 1; i < total; ++i) {
++        const uint8_t* e = f + i * 12;
++        while (i >= stack.back().first) stack.pop_back();
++        std::string name = names + (be32(e) & 0xFFFFFF);
++        if (e[0]) stack.push_back({be32(e + 8), stack.back().second + name + "/"});
++        else g_named.push_back({(uint64_t)be32(e + 4) << g_shift, be32(e + 8), stack.back().second + name});
++    }
++    std::sort(g_named.begin(), g_named.end(), [](const Named& a, const Named& b) { return a.off < b.off; });
++}
++void log_read(uint64_t off, size_t n) {                 // WIIKIT_DISCLOG=1: each file when first read; =all: every read
++    static const char* log = std::getenv("WIIKIT_DISCLOG");
++    if (!log) return;
++    auto it = std::upper_bound(g_named.begin(), g_named.end(), off, [](uint64_t o, const Named& r) { return o < r.off; });
++    if (it == g_named.begin() || off >= (it - 1)->off + (it - 1)->size) {
++        if (!std::strcmp(log, "all")) rt_log("disc: (no file) +%llX %zX", (unsigned long long)off, n);
++        return;
++    }
++    const Named& r = *(it - 1);
++    static std::vector<bool> seen;
++    if (seen.size() < g_named.size()) seen.resize(g_named.size());
++    size_t k = (size_t)(it - 1 - g_named.begin());
++    if (!std::strcmp(log, "all")) rt_log("disc: files/%s +%llX %zX", r.name.c_str(), (unsigned long long)(off - r.off), n);
++    else if (!seen[k]) { seen[k] = true; rt_log("disc: files/%s", r.name.c_str()); }
++}
++
++// (no stat() here: on Windows its file size is 32-bit and it fails on any
++// file over 2 GB, a disc image among them; std::filesystem has no such limit)
++std::string g_root;
++
+ }  // namespace
+ 
+ bool disc_open(const char* dir) {
+     std::string root = dir;
++    g_root = root;
++    if (g_is_image) return true;                       // opened once
++    {                                                  // anything but a folder: an image
++        std::error_code ec;
++        if (!std::filesystem::is_directory(std::filesystem::path(root), ec)) return image_open(dir);
++    }
+     g_regions.clear();
+     g_boot = slurp(root + "/sys/boot.bin");
+     g_fst = slurp(root + "/sys/fst.bin");
+@@ -89,6 +335,7 @@ bool disc_open(const char* dir) {
+ }
+ 
+ size_t disc_read(uint64_t off, void* dst, size_t n) {
++    if (g_is_image) return image_read(off, static_cast<uint8_t*>(dst), n);
+     uint8_t* out = static_cast<uint8_t*>(dst);
+     std::memset(out, 0, n);
+     auto it = std::upper_bound(g_regions.begin(), g_regions.end(), off,
+@@ -118,3 +365,73 @@ const std::vector<uint8_t>& disc_boot() { return g_boot; }
+ bool disc_is_gamecube() { return g_boot.size() >= 0x20 && be32(&g_boot[0x1C]) == 0xC2339F3Du; }
+ const std::vector<uint8_t>& disc_fst() { return g_fst; }
+ size_t disc_regions() { return g_regions.size(); }
++
++// a file beside the partition's payload, as wiikit.disc --extract writes it
++std::vector<uint8_t> disc_sysfile(const char* rel) {
++    std::string r = rel;
++    if (!g_is_image) return slurp(g_root + "/" + r);
++    if (r == "sys/boot.bin") return g_boot;
++    if (r == "sys/fst.bin") return g_fst;
++    if (r == "sys/bi2.bin") return image_part(0x440, 0x2000);
++    if (r == "ticket.bin") return g_img.ticket;
++    if (r == "tmd.bin") return g_img.tmd;
++    if (r == "disc/region.bin") return g_img.region;
++    if (r == "sys/main.dol") {
++        uint64_t dol = (uint64_t)be32(&g_boot[0x420]) << g_shift;
++        std::vector<uint8_t> h = image_part(dol, 0x100);
++        uint64_t end = 0x100;
++        for (int i = 0; i < 18; ++i) end = std::max<uint64_t>(end, (uint64_t)be32(&h[i * 4]) + be32(&h[0x90 + i * 4]));
++        return image_part(dol, (size_t)end);
++    }
++    return {};
++}
++
++bool disc_is_image() { return g_is_image; }
++
++// WIIKIT_DISC_CHECK=FOLDER: every file of the image, and its system files,
++// read through this reader and compared with the same files extracted (by
++// Dolphin's "Extract Entire Disc", or wiikit.disc --extract) in FOLDER.
++int disc_check(const char* folder) {
++    if (!g_is_image) { rt_log("check: not reading an image"); return 1; }
++    std::string root = folder;
++    size_t files = 0, differ = 0, missing = 0;
++    uint64_t bytes = 0;
++    std::vector<uint8_t> a(1 << 20), b(1 << 20);
++    auto compare = [&](const std::string& label, const std::vector<uint8_t>& mine, const std::string& path) {
++        std::vector<uint8_t> theirs = slurp(path);
++        if (theirs.empty()) { rt_log("check: %s: not in the folder", label.c_str()); ++missing; return; }
++        size_t n = std::min(mine.size(), theirs.size());
++        size_t at = 0;
++        while (at < n && mine[at] == theirs[at]) ++at;
++        if (at < n || mine.size() < theirs.size()) { rt_log("check: %s differs at %zX (%zu vs %zu bytes)", label.c_str(), at, mine.size(), theirs.size()); ++differ; }
++    };
++    compare("sys/boot.bin", disc_sysfile("sys/boot.bin"), root + "/sys/boot.bin");
++    compare("sys/bi2.bin", disc_sysfile("sys/bi2.bin"), root + "/sys/bi2.bin");
++    compare("sys/fst.bin", disc_sysfile("sys/fst.bin"), root + "/sys/fst.bin");
++    compare("sys/main.dol", disc_sysfile("sys/main.dol"), root + "/sys/main.dol");
++    compare("tmd.bin", disc_sysfile("tmd.bin"), root + "/tmd.bin");
++    compare("ticket.bin", disc_sysfile("ticket.bin"), root + "/ticket.bin");
++    for (const Named& r : g_named) {
++        FILE* f = std::fopen((root + "/files/" + r.name).c_str(), "rb");
++        if (!f) { rt_log("check: files/%s: not in the folder", r.name.c_str()); ++missing; continue; }
++        bool same = true;
++        for (uint64_t done = 0; done < r.size && same;) {
++            size_t n = (size_t)std::min<uint64_t>(a.size(), r.size - done);
++            image_read(r.off + done, a.data(), n);
++            if (std::fread(b.data(), 1, n, f) != n || std::memcmp(a.data(), b.data(), n)) {
++                size_t at = 0;
++                while (at < n && a[at] == b[at]) ++at;
++                rt_log("check: files/%s differs at %llX", r.name.c_str(), (unsigned long long)(done + at));
++                same = false;
++            }
++            done += n;
++            bytes += n;
++        }
++        std::fclose(f);
++        ++files;
++        if (!same) ++differ;
++        if (files % 250 == 0) rt_log("check: %zu of %zu files...", files, g_named.size());
++    }
++    rt_log("check: %zu files and the system files, %.2f GB: %zu differ, %zu missing", files, bytes / 1e9, differ, missing);
++    return (int)(differ + missing);
++}
+diff --git a/runtime/disc.h b/runtime/disc.h
+index 6709dd6..738bb50 100644
+--- a/runtime/disc.h
++++ b/runtime/disc.h
+@@ -5,9 +5,16 @@
+ #include <cstdint>
+ #include <vector>
+ 
+-bool disc_open(const char* extract_dir);             // sys/ and files/ from wiikit.disc --extract
++bool disc_open(const char* extract_dir);             // sys/ and files/ from wiikit.disc --extract, or a disc image
+ size_t disc_read(uint64_t off, void* dst, size_t n); // partition (GameCube: disc) offset; gaps read as zeros
+ const std::vector<uint8_t>& disc_boot();             // boot.bin: the disc header
+ bool disc_is_gamecube();                              // the header's GameCube magic (0xC2339F3D at 0x1C)
+ const std::vector<uint8_t>& disc_fst();
+ size_t disc_regions();
++// sys/main.dol, sys/bi2.bin, sys/boot.bin, sys/fst.bin, ticket.bin, tmd.bin, disc/region.bin:
++// from the extracted tree, or out of the image
++std::vector<uint8_t> disc_sysfile(const char* rel);
++bool disc_is_image();
++// WIIKIT_DISC_CHECK: the image read through this reader against an extracted folder; the
++// number of files that differ or are missing
++int disc_check(const char* folder);
+diff --git a/runtime/ios.cpp b/runtime/ios.cpp
+index 23d837a..e989c19 100644
+--- a/runtime/ios.cpp
++++ b/runtime/ios.cpp
+@@ -536,8 +536,8 @@ uint32_t ios_irq_mask() { return irq_mask; }
+ 
+ void ios_init(const char* extract_dir, const char* nand_root) {
+     std::string root = extract_dir;
+-    g_ticket = slurp(root + "/ticket.bin");
+-    g_tmd = slurp(root + "/tmd.bin");
++    g_ticket = disc_sysfile("ticket.bin");
++    g_tmd = disc_sysfile("tmd.bin");
+     if (g_ticket.size() < 0x2A4 || g_tmd.size() < 0x1E4)
+         rt_die("%s needs ticket.bin and tmd.bin (python -m wiikit.disc GAME --extract)", extract_dir);
+     for (int i = 0; i < 8; ++i) g_title = g_title << 8 | g_ticket[0x1DC + i];
+diff --git a/runtime/mem.cpp b/runtime/mem.cpp
+index c164101..8d75a55 100644
+--- a/runtime/mem.cpp
++++ b/runtime/mem.cpp
+@@ -51,6 +51,10 @@ uint32_t mem_load_dol(const char* path) {
+     size_t n;
+     while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) d.insert(d.end(), buf, buf + n);
+     std::fclose(f);
++    return mem_load_dol_data(d);
++}
++
++uint32_t mem_load_dol_data(const std::vector<uint8_t>& d) {
+     if (d.size() < 0x100) return 0;
+     for (int i = 0; i < 18; ++i) {
+         uint32_t off = be32(&d[i * 4]), addr = be32(&d[0x48 + i * 4]), size = be32(&d[0x90 + i * 4]);
+diff --git a/runtime/mem.h b/runtime/mem.h
+index c544428..264c18e 100644
+--- a/runtime/mem.h
++++ b/runtime/mem.h
+@@ -1,5 +1,6 @@
+ // wiikit runtime — guest memory and executable loading.
+ #pragma once
++#include <vector>
+ #include <cstdint>
+ #include <cstddef>
+ 
+@@ -11,6 +12,7 @@ bool mem_init();
+ // Load a DOL's text and data sections at their addresses and clear its bss.
+ // Returns the entry point, or 0 on failure.
+ uint32_t mem_load_dol(const char* path);
++uint32_t mem_load_dol_data(const std::vector<uint8_t>& dol);   // the same, from memory
+ // Guest <-> host helpers for tests and HLE.
+ void mem_write(uint32_t addr, const void* src, size_t n);
+ void mem_read(uint32_t addr, void* dst, size_t n);
+diff --git a/runtime/wiiboot.cpp b/runtime/wiiboot.cpp
+index 250d419..d53f4e6 100644
+--- a/runtime/wiiboot.cpp
++++ b/runtime/wiiboot.cpp
+@@ -28,6 +28,7 @@
+ #include "disc.h"
+ #include "mem.h"
+ #include "rt.h"
++#include <filesystem>
+ #include "video.h"
+ #include <algorithm>
+ #include <chrono>
+@@ -51,7 +52,17 @@ int main(int argc, char** argv) {
+     bool audio = true;
+     VideoOptions vo;
+     SysconfOptions so;
+-    std::string root = argv[1], nand = root + "/../nand", fonts = root + "/../fonts";
++    std::string root = argv[1];
++    // beside the extracted tree, or in the folder of the disc image
++    std::string base = root + "/..";
++    {
++        std::error_code ec;                                 // not stat(): 32-bit sizes on Windows, over 2 GB fails
++        if (!std::filesystem::is_directory(std::filesystem::path(root), ec)) {
++            size_t cut = root.find_last_of("/\\");
++            base = cut == std::string::npos ? std::string(".") : root.substr(0, cut);
++        }
++    }
++    std::string nand = base + "/nand", fonts = base + "/fonts";
+     for (int i = 2; i < argc; ++i) {
+         if (!std::strcmp(argv[i], "--nand") && i + 1 < argc) nand = argv[++i];
+         else if (!std::strcmp(argv[i], "--fonts") && i + 1 < argc) fonts = argv[++i];
+@@ -96,9 +107,11 @@ int main(int argc, char** argv) {
+     }
+     std::setvbuf(stdout, nullptr, _IOLBF, 1 << 16);
+     if (!mem_init()) rt_die("cannot reserve the guest address space");
+-    if (vo.keys.empty()) vo.keys = root + "/../keys.txt";
+-    vo.shader_cache = root + "/../shadercache";
++    if (vo.keys.empty()) vo.keys = base + "/keys.txt";
++    vo.shader_cache = base + "/shadercache";
++    if (const char* sc = std::getenv("WIIKIT_SHADER_CACHE"); sc && *sc) vo.shader_cache = sc;
+     const bool gamecube = disc_open(root.c_str()) && disc_is_gamecube();
++    if (const char* chk = std::getenv("WIIKIT_DISC_CHECK"); chk && *chk) std::exit(disc_check(chk) ? 1 : 0);
+     if (!gamecube) vo.widescreen = sysconf_prepare(nand.c_str(), so);
+     uint32_t entry = boot_disc(root.c_str(), g_sysconf_eurgb60);
+     video_configure(vo);
+@@ -116,10 +129,7 @@ int main(int argc, char** argv) {
+     if (std::getenv("WIIKIT_PROFILE")) os_profile();
+     char id[7] = {}, name[65] = {};                           // the disc header: game id and name
+     std::memcpy(id, host(0x80000000), 6);
+-    if (FILE* f = std::fopen((root + "/sys/boot.bin").c_str(), "rb")) {
+-        if (std::fseek(f, 0x20, SEEK_SET) == 0 && std::fread(name, 1, 64, f)) {}
+-        std::fclose(f);
+-    }
++    if (disc_boot().size() >= 0x60) std::memcpy(name, disc_boot().data() + 0x20, 64);
+     std::string title = std::string(name[0] ? name : "wiiboot") + " [" + id + "]";
+     rt_log("wiiboot: %s, entry %08X", title.c_str(), entry);
+     os_start_main(entry);
